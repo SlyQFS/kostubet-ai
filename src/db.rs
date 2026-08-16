@@ -1,0 +1,543 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::text::{meaningful_words, split_chunks};
+
+/// Сообщение, сохранённое в памяти пользователя.
+#[derive(Clone, Debug)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Сведений о гайде для команды /guides.
+#[derive(Clone, Debug)]
+pub struct GuideInfo {
+    pub id: i64,
+    pub title: String,
+    pub chars: usize,
+}
+
+#[derive(Debug)]
+pub enum AddGuideError {
+    Duplicate,
+    Empty,
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for AddGuideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddGuideError::Duplicate => write!(f, "гайд с таким названием уже существует"),
+            AddGuideError::Empty => write!(f, "текст гайда пуст"),
+            AddGuideError::Db(e) => write!(f, "ошибка базы данных: {e}"),
+        }
+    }
+}
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS users (
+    user_id      INTEGER PRIMARY KEY,
+    first_seen   INTEGER NOT NULL,
+    last_activity INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    role       TEXT    NOT NULL,
+    content    TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
+
+CREATE TABLE IF NOT EXISTS guides (
+    guide_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    added_by   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS guide_chunks (
+    chunk_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    guide_id    INTEGER NOT NULL REFERENCES guides(guide_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    content     TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_guide ON guide_chunks(guide_id);
+"#;
+
+const CHUNK_TARGET_CHARS: usize = 1200;
+const CHUNK_HARD_LIMIT_CHARS: usize = 2000;
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Грубая оценка числа токенов (без словаря токенизатора): ~3 символа на токен.
+/// Русский и английский текст в среднем укладывается в эту оценку с запасом.
+fn est_chars_to_tokens(chars: usize) -> usize {
+    chars.div_ceil(3)
+}
+
+/// Хранилище: история переписки отдельно по каждому пользователю (с лимитом
+/// токенов на пользователя) и глобальная база гайдов. Общий размер базы
+/// ограничен и контролируется функцией `enforce_limit`.
+pub struct MemoryStore {
+    conn: Connection,
+    db_path: PathBuf,
+}
+
+impl MemoryStore {
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let db_path = Path::new(path);
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            }
+        }
+        let conn = Connection::open(path)?;
+        // journal_mode возвращает строку с результатом, поэтому через query_row
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL;", [], |r| r.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn, db_path: db_path.to_path_buf() })
+    }
+
+    // ===== История пользователей =====
+
+    pub fn add_message(&self, user_id: i64, role: &str, content: &str) -> rusqlite::Result<()> {
+        let now = unix_now();
+        self.conn.execute(
+            "INSERT INTO users(user_id, first_seen, last_activity) VALUES(?1, ?2, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET last_activity = ?2",
+            params![user_id, now],
+        )?;
+        self.conn.execute(
+            "INSERT INTO messages(user_id, role, content, created_at) VALUES(?1, ?2, ?3, ?4)",
+            params![user_id, role, content, now],
+        )?;
+        Ok(())
+    }
+
+    /// Последние сообщения пользователя, укладывающиеся в бюджет токенов
+    /// (от свежих к старым, пока бюджет не исчерпан). Граница совпадает с
+    /// `trim_user_history`, поэтому в базе не хранится ничего сверх контекста.
+    pub fn user_messages_within_tokens(&self, user_id: i64, token_budget: usize) -> rusqlite::Result<Vec<StoredMessage>> {
+        let mut stmt =
+            self.conn.prepare("SELECT role, content FROM messages WHERE user_id = ?1 ORDER BY id DESC")?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok(StoredMessage { role: r.get(0)?, content: r.get(1)? })
+        })?;
+        let char_budget = token_budget.saturating_mul(3);
+        let mut kept = Vec::new();
+        let mut acc = 0usize;
+        for row in rows {
+            let msg = row?;
+            if acc >= char_budget {
+                break;
+            }
+            acc += msg.content.chars().count();
+            kept.push(msg);
+        }
+        kept.reverse();
+        Ok(kept)
+    }
+
+    /// Удаляет сообщения пользователя, не попадающие в бюджет токенов.
+    /// Возвращает число удалённых строк.
+    pub fn trim_user_history(&self, user_id: i64, token_budget: usize) -> rusqlite::Result<usize> {
+        let char_budget = token_budget.saturating_mul(3) as i64;
+        self.conn.execute(
+            "DELETE FROM messages WHERE user_id = ?1 AND id IN (
+                SELECT id FROM (
+                    SELECT id, length(content) AS len,
+                           SUM(length(content)) OVER (
+                               PARTITION BY user_id ORDER BY id DESC
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ) AS running
+                    FROM messages WHERE user_id = ?1
+                ) WHERE running - len >= ?2
+            )",
+            params![user_id, char_budget],
+        )
+    }
+
+    /// (число сообщений, оценка занятых токенов) по пользователю.
+    pub fn user_stats(&self, user_id: i64) -> rusqlite::Result<(i64, usize)> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(content)), 0) FROM messages WHERE user_id = ?1",
+                params![user_id],
+                |r| Ok((r.get::<_, i64>(0)?, est_chars_to_tokens(r.get::<_, i64>(1)? as usize))),
+            )
+            .optional()
+            .map(|o| o.unwrap_or((0, 0)))
+    }
+
+    pub fn reset_user(&self, user_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM messages WHERE user_id = ?1", params![user_id])?;
+        Ok(())
+    }
+
+    fn trim_all_users(&self, char_budget: i64) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM messages WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, length(content) AS len,
+                           SUM(length(content)) OVER (
+                               PARTITION BY user_id ORDER BY id DESC
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS running
+                    FROM messages
+                ) WHERE running - len >= ?1
+            )",
+            params![char_budget],
+        )
+    }
+
+    // ===== Гайды =====
+
+    pub fn add_guide(&self, title: &str, added_by: i64, content: &str) -> Result<usize, AddGuideError> {
+        let title = title.trim();
+        if title.is_empty() || content.trim().is_empty() {
+            return Err(AddGuideError::Empty);
+        }
+        let exists: Option<i64> = self
+            .conn
+            .query_row("SELECT guide_id FROM guides WHERE title = ?1", params![title], |r| r.get(0))
+            .optional()
+            .map_err(AddGuideError::Db)?;
+        if exists.is_some() {
+            return Err(AddGuideError::Duplicate);
+        }
+
+        let chunks = split_chunks(content, CHUNK_TARGET_CHARS, CHUNK_HARD_LIMIT_CHARS);
+        self.conn
+            .execute(
+                "INSERT INTO guides(title, added_by, created_at) VALUES(?1, ?2, ?3)",
+                params![title, added_by, unix_now()],
+            )
+            .map_err(AddGuideError::Db)?;
+        let guide_id = self.conn.last_insert_rowid();
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.conn
+                .execute(
+                    "INSERT INTO guide_chunks(guide_id, chunk_index, content) VALUES(?1, ?2, ?3)",
+                    params![guide_id, index as i64, chunk],
+                )
+                .map_err(AddGuideError::Db)?;
+        }
+        Ok(chunks.len())
+    }
+
+    pub fn guides(&self) -> rusqlite::Result<Vec<GuideInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.guide_id, g.title, COALESCE(SUM(length(c.content)), 0)
+             FROM guides g LEFT JOIN guide_chunks c ON c.guide_id = g.guide_id
+             GROUP BY g.guide_id ORDER BY g.guide_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(GuideInfo { id: r.get(0)?, title: r.get(1)?, chars: r.get::<_, i64>(2)? as usize })
+        })?;
+        rows.collect()
+    }
+
+    pub fn guides_count(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM guides", [], |r| r.get(0))
+    }
+
+    /// Поиск гайда для удаления: точный id, точное название или уникальный префикс.
+    pub fn find_guide(&self, query: &str) -> rusqlite::Result<Option<i64>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(id) = query.parse::<i64>() {
+            let found: Option<i64> = self
+                .conn
+                .query_row("SELECT guide_id FROM guides WHERE guide_id = ?1", params![id], |r| r.get(0))
+                .optional()?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        let exact: Option<i64> = self
+            .conn
+            .query_row("SELECT guide_id FROM guides WHERE title = ?1", params![query], |r| r.get(0))
+            .optional()?;
+        if exact.is_some() {
+            return Ok(exact);
+        }
+        self.conn
+            .query_row(
+                "SELECT guide_id FROM guides WHERE title LIKE ?1 || '%' ORDER BY length(title) LIMIT 1",
+                params![query],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn delete_guide(&self, guide_id: i64) -> rusqlite::Result<bool> {
+        let deleted = self.conn.execute("DELETE FROM guides WHERE guide_id = ?1", params![guide_id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Релевантные вопросу фрагменты гайдов (заголовок + текст), отобранные
+    /// по совпадению значимых слов и уложенные в бюджет символов.
+    pub fn search_guide_chunks(
+        &self,
+        query_words: &HashSet<String>,
+        budget_chars: usize,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        if query_words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT g.title, c.chunk_index, c.content
+             FROM guide_chunks c JOIN guides g ON g.guide_id = c.guide_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?;
+
+        let mut scored: Vec<(usize, i64, String, String)> = Vec::new();
+        for row in rows {
+            let (title, index, chunk) = row?;
+            let score = meaningful_words(&chunk).intersection(query_words).count();
+            if score > 0 {
+                scored.push((score, index, title, chunk));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        let mut selected: Vec<(String, String)> = Vec::new();
+        let mut used = 0usize;
+        for (_, _, title, chunk) in scored {
+            let len = chunk.chars().count();
+            if used + len > budget_chars {
+                continue;
+            }
+            used += len;
+            selected.push((title, chunk));
+            if used >= budget_chars {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
+    // ===== Общая статистика и лимит =====
+
+    pub fn total_messages(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+    }
+
+    pub fn total_users(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+    }
+
+    /// Фактический размер на диске: файл базы плюс WAL-журнал.
+    /// Транзиентный -shm файл не учитывается: он пересоздаётся при каждом
+    /// запуске и удаляется при закрытии базы.
+    pub fn db_disk_size(&self) -> u64 {
+        let mut total = 0u64;
+        let mut paths = vec![self.db_path.clone()];
+        let mut wal = self.db_path.clone().into_os_string();
+        wal.push("-wal");
+        paths.push(PathBuf::from(wal));
+        for p in paths {
+            if let Ok(meta) = std::fs::metadata(&p) {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    fn vacuum(&self) {
+        if let Err(e) = self.conn.execute("VACUUM", []) {
+            tracing::warn!("VACUUM не удался: {e}");
+        }
+        // wal_checkpoint возвращает строку — читаем её и игнорируем
+        let _ = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |_| Ok(()));
+    }
+
+    /// Следит за общим лимитом размера базы. Возвращает номер этапа, на котором
+    /// удалось уложиться (0 — лимит и так соблюдён). Этапы от бережных к жёстким:
+    /// 1) урезать историю всех пользователей до ~1000 токенов;
+    /// 2) урезать историю всех до ~100 токенов;
+    /// 3) удалить истории всех, кроме 500 самых недавно активных;
+    /// 4) удалять самые старые гайды (до 50 за один вызов).
+    pub fn enforce_limit(&mut self, limit_bytes: u64) -> rusqlite::Result<u8> {
+        // Цель — 95% лимита, чтобы чистка не запускалась на каждом сообщении.
+        let soft_limit = limit_bytes - limit_bytes / 20;
+        if self.db_disk_size() <= soft_limit {
+            return Ok(0);
+        }
+
+        self.trim_all_users(3000)?;
+        self.vacuum();
+        if self.db_disk_size() <= soft_limit {
+            return Ok(1);
+        }
+
+        self.trim_all_users(300)?;
+        self.vacuum();
+        if self.db_disk_size() <= soft_limit {
+            return Ok(2);
+        }
+
+        self.conn.execute(
+            "DELETE FROM users WHERE user_id NOT IN (
+                SELECT user_id FROM users ORDER BY last_activity DESC LIMIT 500
+            )",
+            [],
+        )?;
+        self.vacuum();
+        if self.db_disk_size() <= soft_limit {
+            return Ok(3);
+        }
+
+        let mut deleted = 0;
+        while deleted < 50 {
+            let oldest: Option<i64> = self
+                .conn
+                .query_row("SELECT guide_id FROM guides ORDER BY created_at, guide_id LIMIT 1", [], |r| r.get(0))
+                .optional()?;
+            match oldest {
+                Some(id) => {
+                    self.conn.execute("DELETE FROM guides WHERE guide_id = ?1", params![id])?;
+                    deleted += 1;
+                }
+                None => break,
+            }
+            self.vacuum();
+            if self.db_disk_size() <= soft_limit {
+                return Ok(4);
+            }
+        }
+        Ok(5)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> MemoryStore {
+        let path = std::env::temp_dir().join(format!("kostubetai_test_{}_{}.db", std::process::id(), name));
+        let _ = std::fs::remove_file(&path);
+        for suffix in ["-wal", "-shm"] {
+            let mut os = path.clone().into_os_string();
+            os.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(os));
+        }
+        MemoryStore::open(path.to_str().unwrap()).expect("открыть тестовую базу")
+    }
+
+    #[test]
+    fn messages_respect_token_budget() {
+        let store = temp_db("budget");
+        // 30 сообщений по ~30 токенов — 900 токенов; бюджет 200 → последние ~7.
+        for i in 0..30 {
+            store.add_message(1, "user", &format!("сообщение номер {i} {}", "х".repeat(80))).unwrap();
+        }
+        let kept = store.user_messages_within_tokens(1, 200).unwrap();
+        assert!(!kept.is_empty());
+        assert!(kept.len() < 30);
+        assert!(kept.last().unwrap().content.contains("номер 29"));
+
+        let deleted = store.trim_user_history(1, 200).unwrap();
+        assert!(deleted > 0);
+        let (count, tokens) = store.user_stats(1).unwrap();
+        assert_eq!(count as usize, kept.len());
+        assert!(tokens <= 250, "занято {tokens} токенов при бюджете 200");
+
+        // После обрезки повторный выбор возвращает то же окно.
+        let again = store.user_messages_within_tokens(1, 200).unwrap();
+        assert_eq!(again.len(), kept.len());
+        assert_eq!(again.last().unwrap().content, kept.last().unwrap().content);
+    }
+
+    #[test]
+    fn reset_user_clears_history() {
+        let store = temp_db("reset");
+        store.add_message(7, "user", "привет").unwrap();
+        store.add_message(7, "assistant", "привет!").unwrap();
+        assert_eq!(store.user_stats(7).unwrap().0, 2);
+        store.reset_user(7).unwrap();
+        assert_eq!(store.user_stats(7).unwrap().0, 0);
+    }
+
+    #[test]
+    fn guides_lifecycle_and_search() {
+        let store = temp_db("guides");
+        let rust_guide = "Гайд по Rust\n\nCargo — система сборки. Крейты подключаются в Cargo.toml.\n\n\
+                          Ownership и borrow checker — основа безопасности памяти в Rust.";
+        let cook_guide = "Кулинарный гайд\n\nБорщ варится из свёклы и капусты. Подавать со сметаной.";
+        assert_eq!(store.add_guide("rust", 1, rust_guide).unwrap(), 1);
+        assert_eq!(store.add_guide("борщ", 1, cook_guide).unwrap(), 1);
+
+        assert!(matches!(store.add_guide("rust", 1, "дубль").unwrap_err(), AddGuideError::Duplicate));
+        assert!(matches!(store.add_guide("пустой", 1, "  ").unwrap_err(), AddGuideError::Empty));
+
+        let list = store.guides().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|g| g.title == "rust" && g.chars > 100));
+
+        // Поиск по «борщ» находит кулинарный гайд, а не гайд по Rust.
+        let words = meaningful_words("как приготовить борщ?");
+        let hits = store.search_guide_chunks(&words, 4000).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, "борщ");
+        assert!(hits[0].1.contains("свёклы"));
+
+        // Поиск по «cargo crate» находит гайд по Rust.
+        let words = meaningful_words("как подключить crate в cargo");
+        let hits = store.search_guide_chunks(&words, 4000).unwrap();
+        assert!(hits.iter().any(|(title, _)| title == "rust"));
+
+        // find_guide: по id, точному названию и префиксу.
+        assert_eq!(store.find_guide("1").unwrap(), Some(1));
+        assert_eq!(store.find_guide("rust").unwrap(), Some(1));
+        assert_eq!(store.find_guide("бор").unwrap(), Some(2));
+        assert_eq!(store.find_guide("нет такого").unwrap(), None);
+
+        assert!(store.delete_guide(1).unwrap());
+        assert!(!store.delete_guide(1).unwrap());
+        assert_eq!(store.guides_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn enforce_limit_trims_histories() {
+        let mut store = temp_db("limit");
+        // Малая база — лимит срабатывать не должен.
+        for i in 0..10 {
+            store.add_message(99, "user", &format!("лёгкое сообщение {i}")).unwrap();
+        }
+        assert_eq!(store.enforce_limit(1024 * 1024).unwrap(), 0);
+
+        let payload = "д".repeat(300);
+        for user in 1..=3 {
+            for i in 0..300 {
+                store.add_message(user, "user", &format!("{i} {payload}")).unwrap();
+            }
+        }
+        let before = store.db_disk_size();
+        assert!(before > 64 * 1024, "база должна была вырасти: {before} байт");
+
+        let stage = store.enforce_limit(60 * 1024).unwrap();
+        let after = store.db_disk_size();
+        assert!(after < before / 2, "чистка должна заметно уменьшить базу: {after} из {before}");
+        assert!(stage >= 1 && stage <= 3);
+        for user in 1..=3 {
+            let (count, _) = store.user_stats(user).unwrap();
+            // 3000 символов бюджета / ~310 символов на сообщение — не больше пары десятков.
+            assert!(count < 30, "у пользователя {user} осталось {count} сообщений");
+        }
+    }
+}

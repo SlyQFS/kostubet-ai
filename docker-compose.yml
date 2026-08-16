@@ -1,0 +1,15 @@
+services:
+  kostubetai:
+    build: .
+    image: kostubetai:latest
+    container_name: kostubetai
+    # init-процесс корректно репает зомби и пробрасывает сигналы PID 1
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # База SQLite переживает пересборки и обновления контейнера.
+      - kostubetai-data:/app/data
+
+volumes:
+  kostubetai-data:
