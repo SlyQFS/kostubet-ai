@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use teloxide::prelude::*;
-use teloxide::types::{Chat, ChatAction, ChatId, Document, ReplyParameters, User, UserId};
+use teloxide::types::{Chat, ChatAction, ChatId, Document, ReplyParameters, UserId};
 use teloxide::utils::command::BotCommands;
 
 use crate::config::Config;
@@ -13,7 +13,10 @@ use crate::text::{fmt_bytes, split_telegram};
 const MAX_GUIDE_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 const HELP_ADMIN_TEXT: &str = "\
-Привет! Я KostubetAI — ИИ-собеседник с памятью 🧠
+Привет! Я KostubetAI — официальный ИИ-ассистент, созданный @slyqfs 🧠
+
+В личных сообщениях доступны команды управления и загрузка гайдов.
+Общение с нейросетью работает в группах/суперчатах (при упоминании бота или ответе на его сообщение).
 
 Команды управления (только для администраторов):
 /reset — очистить память о диалоге
@@ -22,20 +25,20 @@ const HELP_ADMIN_TEXT: &str = "\
 /guide_add <название> — добавить гайд (ответь этой командой на сообщение с текстом)
 /guide_del <название или id> — удалить гайд
 
-Настройки LLM API:
-/settings — текущие настройки API и модели
+Настройки LLM API и промпта:
+/settings — текущие настройки API, модели и промпта
 /set_model <модель> — сменить модель (например gpt-4o-mini)
 /set_api <base_url> — сменить адрес API (например https://api.openai.com/v1)
 /set_key <ключ> — задать API-ключ
-/reset_setting <model|api|key|all> — сбросить настройку к значению из .env
+/set_prompt <текст> — задать системный промпт
+/reset_setting <model|api|key|prompt|all> — сбросить настройку к значению из .env
 
 Гайд можно также загрузить файлом: просто пришли текстовый документ (.txt, .md, .json, ...) с названием в подписи.";
 
 const HELP_USER_TEXT: &str = "\
-Привет! Я KostubetAI — умный ИИ-собеседник с памятью 🧠
+Привет! Я KostubetAI — официальный ИИ-ассистент, созданный @slyqfs 🧠
 
-Я помню нашу переписку и готов ответить на любые вопросы.
-Просто напиши мне сообщение!";
+В личных сообщениях я не веду диалог. Чтобы пообщаться со мной, добавь меня в группу или суперчат и задай вопрос через тег (@имя_бота) или ответь (reply) на моё сообщение!";
 
 pub struct AppState {
     pub mgr: MemoryManager,
@@ -73,10 +76,11 @@ pub fn bot_commands() -> Vec<teloxide::types::BotCommand> {
         BotCommand::new("guides", "список гайдов (админ)"),
         BotCommand::new("guide_add", "добавить гайд ответом на сообщение (админ)"),
         BotCommand::new("guide_del", "удалить гайд (админ)"),
-        BotCommand::new("settings", "настройки API и модели (админ)"),
+        BotCommand::new("settings", "настройки API, модели и промпта (админ)"),
         BotCommand::new("set_model", "задать модель (админ)"),
         BotCommand::new("set_api", "задать адрес API (админ)"),
         BotCommand::new("set_key", "задать API-ключ (админ)"),
+        BotCommand::new("set_prompt", "задать системный промпт (админ)"),
         BotCommand::new("reset_setting", "сбросить настройку (админ)"),
     ]
 }
@@ -212,6 +216,11 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
     if let Some(value) = manual_command_args(&text, "/set_key", bot_username) {
         return handle_set_key(bot, msg, value, state).await;
     }
+    if let Some(value) = manual_command_args(&text, "/set_prompt", bot_username)
+        .or_else(|| manual_command_args(&text, "/set_system_prompt", bot_username))
+    {
+        return handle_set_prompt(bot, msg, value, state).await;
+    }
     if let Some(value) = manual_command_args(&text, "/reset_setting", bot_username) {
         return handle_reset_setting(bot, msg, value, state).await;
     }
@@ -221,34 +230,102 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
 
     let (should_reply, clean) = should_reply(&msg, &state, &text);
     if !should_reply {
-        tracing::debug!(user_id, chat_id = msg.chat.id.0, "сообщение в группе пропущено (нет тега @бота или ответа)");
+        tracing::debug!(user_id, chat_id = msg.chat.id.0, "сообщение пропущено (в ЛС или в группе без обращения к боту)");
         return Ok(());
     }
     let user_text = if clean.is_empty() { "Привет!".to_string() } else { clean };
 
-    tracing::info!(user_id, "отправка запроса в LLM...");
+    tracing::info!(user_id, "отправка запроса в LLM (прогрессивный стриминг)...");
     let typing = spawn_typing(bot.clone(), msg.chat.id);
     let start = std::time::Instant::now();
-    let answer = state.mgr.reply(user_id, &user_text).await;
+
+    // Отправляем плейсхолдер для прогрессивного заполнения
+    let placeholder_res = bot
+        .send_message(msg.chat.id, "💬 Думаю...")
+        .reply_parameters(ReplyParameters::new(msg.id))
+        .await;
+
+    let placeholder_msg = match placeholder_res {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!("не удалось отправить начальный плейсхолдер: {e}");
+            None
+        }
+    };
+
+    let accum = Arc::new(std::sync::Mutex::new(String::new()));
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let accum_clone = accum.clone();
+    let on_delta = move |delta: &str| {
+        let mut a = accum_clone.lock().unwrap_or_else(|p| p.into_inner());
+        a.push_str(delta);
+    };
+
+    // Фоновая задача обновления текста в сообщении раз в 1.5 секунды
+    let accum_bg = accum.clone();
+    let finished_bg = finished.clone();
+    let bot_bg = bot.clone();
+    let chat_id = msg.chat.id;
+    let ph_id = placeholder_msg.as_ref().map(|m| m.id);
+
+    let update_task = tokio::spawn(async move {
+        let mut last_shown = String::new();
+        let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if finished_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let current = {
+                accum_bg.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            };
+            let current_trim = current.trim();
+            if !current_trim.is_empty() && current_trim != last_shown {
+                last_shown = current_trim.to_string();
+                if let Some(target_id) = ph_id {
+                    let preview: String = current_trim.chars().take(3800).collect();
+                    let _ = bot_bg.edit_message_text(chat_id, target_id, format!("{preview} ▌")).await;
+                }
+            }
+        }
+    });
+
+    let answer = state.mgr.reply_stream(user_id, &user_text, on_delta).await;
+    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = update_task.await;
     typing.abort();
 
     match answer {
         Ok(a) if !a.trim().is_empty() => {
-            tracing::info!(user_id, elapsed_ms = start.elapsed().as_millis(), chars = a.trim().len(), "получен ответ от LLM, отправляю пользователю");
-            send_chunks(&bot, &msg, a.trim()).await?;
-        }
-        Ok(_) => tracing::warn!(user_id, "модель вернула пустой ответ"),
-        Err(e) => {
-            tracing::error!(user_id, elapsed_ms = start.elapsed().as_millis(), "ошибка генерации ответа: {e}");
-            let error_text = if is_admin(&state, user_id) {
-                format!("⚠️ Ошибка LLM API: {e}\nПроверь настройки: /settings")
+            let final_text = a.trim();
+            tracing::info!(user_id, elapsed_ms = start.elapsed().as_millis(), chars = final_text.len(), "ответ получен и выведен пользователю");
+            if let Some(ph) = placeholder_msg {
+                let chunks = split_telegram(final_text, 3900);
+                if let Some(first) = chunks.first() {
+                    let _ = bot.edit_message_text(chat_id, ph.id, first).await;
+                }
+                for chunk in chunks.iter().skip(1) {
+                    let _ = bot.send_message(chat_id, chunk).await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             } else {
-                "⚠️ Не получилось связаться с моделью. Попробуй ещё раз чуть позже.".to_string()
-            };
-            let _ = bot
-                .send_message(msg.chat.id, error_text)
-                .reply_parameters(ReplyParameters::new(msg.id))
-                .await;
+                send_chunks(&bot, &msg, final_text).await?;
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(user_id, "модель вернула пустой ответ");
+            if let Some(ph) = placeholder_msg {
+                let _ = bot.delete_message(chat_id, ph.id).await;
+            }
+        }
+        Err(e) => {
+            // Ошибки в чат ни в коем случае не отправляем — только логируем
+            tracing::error!(user_id, elapsed_ms = start.elapsed().as_millis(), "ошибка генерации ответа после реконнектов: {e}");
+            if let Some(ph) = placeholder_msg {
+                let _ = bot.delete_message(chat_id, ph.id).await;
+            }
         }
     }
     Ok(())
@@ -390,11 +467,14 @@ async fn handle_document(bot: Bot, msg: Message, doc: &Document, state: Arc<AppS
         return Ok(());
     };
 
-    // В группах реагируем только на документы, присланные с упоминанием бота.
     let caption = msg.caption().map(ToOwned::to_owned).unwrap_or_default();
-    let (should_reply, _) = should_reply(&msg, &state, &caption);
-    if !should_reply {
-        return Ok(());
+
+    // В группах реагируем на документы с упоминанием/ответом; в ЛС принимаем документы админа напрямую.
+    if !msg.chat.is_private() {
+        let (should_reply, _) = should_reply(&msg, &state, &caption);
+        if !should_reply {
+            return Ok(());
+        }
     }
     if !is_admin(&state, user_id) {
         bot.send_message(msg.chat.id, "🔒 Загружать гайды может только администратор бота.").await?;
@@ -540,31 +620,75 @@ fn is_allowed(state: &AppState, msg: &Message) -> bool {
     chat_allowed(state, msg) && thread_allowed(state, msg)
 }
 
-/// В приватном чате отвечаем всегда; в группах — только при упоминании @бота
-/// или когда пользователь отвечает на сообщение бота.
-fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, String) {
+/// В приватных чатах (ЛС) нейросетью не отвечаем (доступны только команды);
+/// в группах — отвечаем при упоминании @бота, ответе (reply) на сообщение бота или цитировании.
+pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, String) {
     if msg.chat.is_private() {
-        return (true, text.trim().to_string());
+        return (false, String::new());
     }
     let mut mentioned = false;
     let mut clean = text.to_string();
+
+    // 1. Поиск тега @bot_username в тексте или подписи
     if let Some(username) = &state.bot_username {
         let tag = format!("@{username}");
-        if let Some(pos) = clean.to_lowercase().find(&tag.to_lowercase()) {
-            mentioned = true;
-            clean.replace_range(pos..pos + tag.len(), " ");
+        let mut words_out = Vec::new();
+        for word in clean.split_whitespace() {
+            if word.eq_ignore_ascii_case(&tag) {
+                mentioned = true;
+            } else if word.to_lowercase().starts_with(&tag.to_lowercase()) {
+                mentioned = true;
+                let remainder = &word[tag.len()..];
+                if !remainder.is_empty() {
+                    words_out.push(remainder);
+                }
+            } else {
+                words_out.push(word);
+            }
         }
+        clean = words_out.join(" ");
     }
-    let replied_to_bot = msg
-        .reply_to_message()
-        .and_then(|m| m.from.as_ref())
-        .map(|u: &User| u.id == state.bot_id)
-        .unwrap_or(false);
+
+    // 2. Проверка ответа (reply) на сообщение бота
+    let replied_to_bot = if let Some(reply) = msg.reply_to_message() {
+        let from_bot = reply
+            .from
+            .as_ref()
+            .map(|u| {
+                u.id == state.bot_id
+                    || state
+                        .bot_username
+                        .as_deref()
+                        .map(|b| u.username.as_deref().map(|un| un.eq_ignore_ascii_case(b)).unwrap_or(false))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        let via_bot = reply
+            .via_bot
+            .as_ref()
+            .map(|u| u.id == state.bot_id)
+            .unwrap_or(false);
+
+        let sender_chat_bot = reply
+            .sender_chat
+            .as_ref()
+            .map(|c| c.id.0 == state.bot_id.0 as i64)
+            .unwrap_or(false);
+
+        from_bot || via_bot || sender_chat_bot
+    } else {
+        false
+    };
+
+    // 3. Проверка цитирования (quotes)
+    let quoted_bot = msg.quote().is_some() && replied_to_bot;
+
     let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    (mentioned || replied_to_bot, clean)
+    (mentioned || replied_to_bot || quoted_bot, clean)
 }
 
-// ===== Админ-панель: настройки API и модели =====
+// ===== Админ-панель: настройки API, модели и промпта =====
 
 /// Текстовое представление текущих настроек для команды /settings.
 fn format_settings(mgr: &MemoryManager) -> String {
@@ -575,25 +699,43 @@ fn format_settings(mgr: &MemoryManager) -> String {
     } else {
         mask_key(&s.api_key)
     };
+    let prompt_preview: String = if s.system_prompt.chars().count() > 80 {
+        let p: String = s.system_prompt.chars().take(80).collect();
+        format!("{p}...")
+    } else {
+        s.system_prompt.clone()
+    };
+    let def_prompt_preview: String = if s.default_system_prompt.chars().count() > 60 {
+        let p: String = s.default_system_prompt.chars().take(60).collect();
+        format!("{p}...")
+    } else {
+        s.default_system_prompt.clone()
+    };
     format!(
         "⚙️ Текущие настройки LLM\n\n\
          Модель: {model}\n  → {mark_model}\n\
          API: {base_url}\n  → {mark_api}\n\
-         Ключ: {key_preview}\n  → {mark_key}\n\n\
-         Дефолт из .env: модель «{default_model}», API «{default_base_url}»\n\n\
+         Ключ: {key_preview}\n  → {mark_key}\n\
+         Промпт: «{prompt_preview}»\n  → {mark_prompt}\n\n\
+         Дефолт из .env: модель «{default_model}», API «{default_base_url}»\n\
+         Дефолтный промпт: «{def_prompt_preview}»\n\n\
          Команды изменения:\n\
          /set_model <модель>\n\
          /set_api <base_url>\n\
          /set_key <ключ>\n\
-         /reset_setting <model|api|key|all>",
+         /set_prompt <текст>\n\
+         /reset_setting <model|api|key|prompt|all>",
         model = s.model,
         mark_model = mark(crate::memory::SETTING_MODEL),
         base_url = s.base_url,
         mark_api = mark(crate::memory::SETTING_BASE_URL),
         key_preview = key_preview,
         mark_key = mark(crate::memory::SETTING_API_KEY),
+        prompt_preview = prompt_preview,
+        mark_prompt = mark(crate::memory::SETTING_SYSTEM_PROMPT),
         default_model = s.default_model,
         default_base_url = s.default_base_url,
+        def_prompt_preview = def_prompt_preview,
     )
 }
 
@@ -733,6 +875,48 @@ async fn handle_set_key(
     Ok(())
 }
 
+async fn handle_set_prompt(
+    bot: Bot,
+    msg: Message,
+    value: &str,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or_default();
+    if !is_admin(&state, user_id) {
+        bot.send_message(msg.chat.id, "🔒 Настройки доступны только администратору бота.").await?;
+        return Ok(());
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        let current_prompt = state.mgr.effective_system_prompt();
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "📝 Укажи системный промпт: /set_prompt <текст>\n\
+                 Например: /set_prompt Ты — эксперт по Rust. Отвечай кратко и емко.\n\n\
+                 Текущий системный промпт:\n«{current_prompt}»\n\n\
+                 Сбросить к дефолту из .env: /reset_setting prompt"
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    if value.chars().count() > 4000 {
+        bot.send_message(msg.chat.id, "⚠️ Системный промпт слишком длинный (максимум 4000 символов).").await?;
+        return Ok(());
+    }
+    match state.mgr.set_setting(crate::memory::SETTING_SYSTEM_PROMPT, value) {
+        Ok(()) => {
+            tracing::info!(user_id, "системный промпт обновлен");
+            bot.send_message(msg.chat.id, "✅ Системный промпт успешно сохранён.").await?;
+        }
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("⚠️ Не удалось сохранить системный промпт: {e}")).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Маскирует ключ для вывода: первые 3 и последние 2 символа, остальное точками.
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
@@ -759,10 +943,11 @@ async fn handle_reset_setting(
     if query.is_empty() {
         bot.send_message(
             msg.chat.id,
-            "Укажи, какую настройку сбросить: /reset_setting <model|api|key|all>\n\
+            "Укажи, какую настройку сбросить: /reset_setting <model|api|key|prompt|all>\n\
              • model — сбросить модель к значению из .env\n\
              • api — сбросить адрес API к значению из .env\n\
              • key — сбросить API-ключ к значению из .env\n\
+             • prompt — сбросить системный промпт к значению по умолчанию\n\
              • all — сбросить все переопределённые настройки\n\n\
              Текущие настройки: /settings",
         )
@@ -774,6 +959,7 @@ async fn handle_reset_setting(
             crate::memory::SETTING_MODEL,
             crate::memory::SETTING_BASE_URL,
             crate::memory::SETTING_API_KEY,
+            crate::memory::SETTING_SYSTEM_PROMPT,
         ];
         let mut count = 0;
         for key in keys {
@@ -793,10 +979,11 @@ async fn handle_reset_setting(
         "model" | "модель" => crate::memory::SETTING_MODEL,
         "api" | "url" | "base_url" | "адрес" => crate::memory::SETTING_BASE_URL,
         "key" | "ключ" => crate::memory::SETTING_API_KEY,
+        "prompt" | "system_prompt" | "промпт" => crate::memory::SETTING_SYSTEM_PROMPT,
         _ => {
             bot.send_message(
                 msg.chat.id,
-                "⚠️ Неизвестная настройка. Доступно: model, api, key, all.",
+                "⚠️ Неизвестная настройка. Доступно: model, api, key, prompt, all.",
             )
             .await?;
             return Ok(());
@@ -823,6 +1010,7 @@ fn setting_label(key: &str) -> &'static str {
         crate::memory::SETTING_MODEL => "модель",
         crate::memory::SETTING_BASE_URL => "API",
         crate::memory::SETTING_API_KEY => "ключ",
+        crate::memory::SETTING_SYSTEM_PROMPT => "системный промпт",
         _ => "настройка",
     }
 }
@@ -842,6 +1030,7 @@ mod tests {
         assert_eq!(manual_command_args("/set_api https://openai.com", "/set_api", None), Some("https://openai.com"));
         assert_eq!(manual_command_args("/set_api", "/set_api", None), Some(""));
         assert_eq!(manual_command_args("/set_model", "/set_model", None), Some(""));
+        assert_eq!(manual_command_args("/set_prompt Ты бот", "/set_prompt", None), Some("Ты бот"));
         assert_eq!(manual_command_args("/guide_del rust", "/guide_del", None), Some("rust"));
         assert_eq!(manual_command_args("/guide_addxxx", "/guide_add", None), None);
         assert_eq!(manual_command_args("привет", "/guide_add", None), None);

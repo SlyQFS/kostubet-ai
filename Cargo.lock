@@ -879,6 +879,7 @@ name = "kostubetai"
 version = "1.0.0"
 dependencies = [
  "dotenvy",
+ "futures-util",
  "reqwest",
  "rusqlite",
  "serde",

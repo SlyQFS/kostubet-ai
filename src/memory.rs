@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
 use crate::config::Config;
 use crate::db::MemoryStore;
@@ -12,17 +15,10 @@ const GUIDE_CONTEXT_CHARS: usize = 4000;
 pub const SETTING_BASE_URL: &str = "llm_base_url";
 pub const SETTING_API_KEY: &str = "llm_api_key";
 pub const SETTING_MODEL: &str = "llm_model";
+pub const SETTING_SYSTEM_PROMPT: &str = "system_prompt";
 
-fn build_system_prompt(guide_hits: &[(String, String)]) -> String {
-    let mut prompt = String::from(
-        "Ты — KostubetAI, дружелюбный и сообразительный ИИ-собеседник в Telegram.\n\
-         Правила:\n\
-         — Отвечай на языке собеседника (по умолчанию — русский).\n\
-         — Пиши простым текстом: без Markdown-разметки (звёздочек, решёток, обратных кавычек), Telegram её не отображает.\n\
-         — Отвечай по существу и живо; в перечислениях используй строки с дефисом.\n\
-         — Ты видишь последние сообщения этого пользователя. Опирайся на них, чтобы помнить контекст беседы.\n\
-         — Не выдумывай факты, которых нет в сообщениях или в выдержках из гайдов ниже.",
-    );
+pub fn build_system_prompt(base_prompt: &str, guide_hits: &[(String, String)]) -> String {
+    let mut prompt = base_prompt.trim().to_string();
     if !guide_hits.is_empty() {
         prompt.push_str(
             "\n\nВыдержки из базы знаний (гайдов), релевантные текущему вопросу. \
@@ -41,31 +37,56 @@ pub struct UserSnapshot {
     pub est_tokens: usize,
 }
 
-/// Менеджер памяти. Хранит для каждого пользователя только дословную историю
-/// последних сообщений в пределах лимита токенов (по умолчанию 5000) — ничего
-/// лишнего не запоминается и не пересказывается. При каждом вопросе в контекст
-/// также подмешиваются релевантные выдержки из загруженных гайдов.
+/// Менеджер памяти и очереди запросов.
+/// Хранит для каждого пользователя только дословную историю последних сообщений,
+/// управляет очередью и защищает от перегрузок через семафор параллельности и блокировку на пользователя.
 #[derive(Clone)]
 pub struct MemoryManager {
     store: Arc<Mutex<MemoryStore>>,
     llm: LlmClient,
     cfg: Arc<Config>,
+    semaphore: Arc<Semaphore>,
+    user_locks: Arc<TokioMutex<HashMap<i64, Arc<TokioMutex<()>>>>>,
+    last_request_time: Arc<TokioMutex<std::time::Instant>>,
 }
 
 impl MemoryManager {
     pub fn new(store: Arc<Mutex<MemoryStore>>, llm: LlmClient, cfg: Arc<Config>) -> Self {
-        Self { store, llm, cfg }
+        let max_concurrent = cfg.max_concurrent_requests;
+        Self {
+            store,
+            llm,
+            cfg,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            user_locks: Arc::new(TokioMutex::new(HashMap::new())),
+            last_request_time: Arc::new(TokioMutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10))),
+        }
     }
 
     fn store(&self) -> MutexGuard<'_, MemoryStore> {
         self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Главная функция: записать сообщение пользователя, собрать контекст из его
-    /// личной истории и релевантных гайдов, получить ответ и обрезать историю
-    /// до лимита токенов. Сообщение пользователя сохраняется до вызова модели,
-    /// чтобы даже при сбое ответа оно осталось в памяти.
+    /// Получает мьютекс для конкретного пользователя, чтобы его запросы обрабатывались строго последовательно.
+    async fn user_lock(&self, user_id: i64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.user_locks.lock().await;
+        locks
+            .entry(user_id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    /// Синхронная/нестриминговая обёртка над reply_stream.
+    #[allow(dead_code)]
     pub async fn reply(&self, user_id: i64, text: &str) -> Result<String, String> {
+        self.reply_stream(user_id, text, |_| {}).await
+    }
+
+    /// Стриминговая генерация ответа с передачей инкрементов текста через callback on_delta.
+    pub async fn reply_stream<F>(&self, user_id: i64, text: &str, on_delta: F) -> Result<String, String>
+    where
+        F: FnMut(&str) + Send,
+    {
         let user_content: String = if text.chars().count() > 15_000 {
             let mut cut: String = text.chars().take(15_000).collect();
             cut.push_str("\n[сообщение обрезано из-за длины]");
@@ -74,6 +95,11 @@ impl MemoryManager {
             text.to_string()
         };
 
+        // Захватываем блокировку пользователя для защиты от параллельного спама одного юзера
+        let u_lock = self.user_lock(user_id).await;
+        let _user_guard = u_lock.lock().await;
+
+        // Сохраняем входящее сообщение до сетевого вызова
         {
             let store = self.store();
             store
@@ -92,8 +118,9 @@ impl MemoryManager {
             (history, guide_hits)
         };
 
+        let base_prompt = self.effective_system_prompt();
         let mut messages = Vec::with_capacity(history.len() + 1);
-        messages.push(ChatMessage::system(build_system_prompt(&guide_hits)));
+        messages.push(ChatMessage::system(build_system_prompt(&base_prompt, &guide_hits)));
         for m in history {
             if m.role == "assistant" {
                 messages.push(ChatMessage::assistant(m.content));
@@ -102,13 +129,35 @@ impl MemoryManager {
             }
         }
 
-        // Эффективные настройки: переопределение из БД (админ-панель) либо .env.
+        // Эффективные настройки подключения: переопределение из БД либо .env
         let settings = self.effective_settings();
+
+        // Захват слота очереди (семафора). Если все слоты заняты — ожидаем в FIFO очереди.
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| "внутренняя ошибка очереди".to_string())?;
+
+        // Пейсер запросов: сглаживает залповые вопросы (burst), предотвращая 403 и 429 от WAF
+        {
+            let mut last = self.last_request_time.lock().await;
+            let min_interval = std::time::Duration::from_millis(1500);
+            let elapsed = last.elapsed();
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+            *last = std::time::Instant::now();
+        }
+
         let answer = self
             .llm
-            .chat(&settings, &messages, self.cfg.max_reply_tokens, self.cfg.temperature)
+            .stream_chat(&settings, &messages, self.cfg.max_reply_tokens, self.cfg.temperature, on_delta)
             .await
             .map_err(|e| format!("{e}"))?;
+
+        // Освобождение семафора происходит автоматически при дропе _permit
+        drop(_permit);
 
         {
             let store = self.store();
@@ -128,7 +177,7 @@ impl MemoryManager {
         Ok(answer)
     }
 
-    /// Дёшев проверяет общий размер базы; при превышении 95% лимита чистит.
+    /// Проверяет общий размер базы; при превышении 95% лимита чистит.
     fn check_global_limit(&self) {
         let mut store = self.store();
         if store.db_disk_size() > self.cfg.memory_limit_bytes * 95 / 100 {
@@ -180,7 +229,7 @@ impl MemoryManager {
         self.cfg.user_memory_tokens
     }
 
-    // ===== Настройки LLM (админ-панель) =====
+    // ===== Настройки LLM и системный промпт (админ-панель) =====
 
     /// Эффективные настройки: значение из БД, если задано, иначе дефолт из .env.
     pub fn effective_settings(&self) -> LlmSettings {
@@ -205,17 +254,31 @@ impl MemoryManager {
         LlmSettings { base_url, api_key, model }
     }
 
+    /// Эффективный системный промпт (из БД, если переопределён, иначе дефолт).
+    pub fn effective_system_prompt(&self) -> String {
+        let store = self.store();
+        store
+            .get_setting(SETTING_SYSTEM_PROMPT)
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.cfg.default_system_prompt.clone())
+    }
+
     /// Снимок настроек для команды /settings: (поля, переопределённые ключи).
     pub fn settings_snapshot(&self) -> SettingsSnapshot {
         let eff = self.effective_settings();
+        let prompt = self.effective_system_prompt();
         let store = self.store();
         let overridden: Vec<String> = store.all_settings().unwrap_or_default();
         SettingsSnapshot {
             base_url: eff.base_url,
             api_key: eff.api_key,
             model: eff.model,
+            system_prompt: prompt,
             default_base_url: self.cfg.llm_base_url.clone(),
             default_model: self.cfg.llm_model.clone(),
+            default_system_prompt: self.cfg.default_system_prompt.clone(),
             overridden,
         }
     }
@@ -234,9 +297,11 @@ pub struct SettingsSnapshot {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub system_prompt: String,
     pub default_base_url: String,
     pub default_model: String,
-    /// Ключи, переопределённые в БД (llm_base_url, llm_api_key, llm_model).
+    pub default_system_prompt: String,
+    /// Ключи, переопределённые в БД (llm_base_url, llm_api_key, llm_model, system_prompt).
     pub overridden: Vec<String>,
 }
 
@@ -252,11 +317,12 @@ mod tests {
 
     #[test]
     fn system_prompt_with_and_without_guides() {
-        let plain = build_system_prompt(&[]);
-        assert!(plain.contains("KostubetAI"));
-        assert!(!plain.contains("гайда"));
+        let base = "Ты умный бот.";
+        let plain = build_system_prompt(base, &[]);
+        assert_eq!(plain, base);
 
-        let with = build_system_prompt(&[("rust".into(), "Cargo.toml".into())]);
+        let with = build_system_prompt(base, &[("rust".into(), "Cargo.toml".into())]);
+        assert!(with.starts_with(base));
         assert!(with.contains("Из гайда «rust»"));
         assert!(with.contains("Cargo.toml"));
     }
