@@ -17,6 +17,13 @@ pub struct Config {
     pub admins: HashSet<i64>,
     pub max_reply_tokens: u32,
     pub temperature: f32,
+    /// Чат(ы), в которых бот активен. Пусто — бот работает в любом чате.
+    /// Поддерживаются и суперчаты (группы), и личные чаты.
+    pub allowed_chats: HashSet<i64>,
+    /// Темы (топики) форум-супергрупп, в которых бот активен.
+    /// Пусто — бот работает во всех темах. Применяется только к чатам с
+    /// включёнными темами (is_forum); обычные группы и лички не затрагиваются.
+    pub allowed_threads: HashSet<i64>,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -36,6 +43,27 @@ fn parse_num<T: std::str::FromStr>(key: &str, default: &str) -> Result<T, String
         .map_err(|_| format!("неверное значение переменной {key}: ожидается число"))
 }
 
+/// Парсит список целых чисел через запятую из переменной окружения `key`.
+fn parse_id_list(key: &str) -> HashSet<i64> {
+    var(key)
+        .map(|list| {
+            list.split(',')
+                .filter_map(|id| id.trim().parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Если переменная задана и непуста, но не распарсилась ни одна id — ошибка.
+fn validate_id_list(key: &str, set: &HashSet<i64>, what: &str) -> Result<(), String> {
+    if !var(key).map(|v| v.is_empty()).unwrap_or(true) && set.is_empty() {
+        return Err(format!(
+            "{key} задан, но не содержит корректных числовых {what}"
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let bot_token = var("TELEGRAM_BOT_TOKEN")
@@ -50,22 +78,20 @@ impl Config {
         let max_reply_tokens: u32 = parse_num("MAX_REPLY_TOKENS", "1500")?;
         let temperature: f32 = parse_num("LLM_TEMPERATURE", "0.7")?;
 
-        let admins: HashSet<i64> = var("ADMIN_USER_IDS")
-            .map(|list| {
-                list.split(',')
-                    .filter_map(|id| id.trim().parse::<i64>().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !var("ADMIN_USER_IDS").map(|v| v.is_empty()).unwrap_or(true) && admins.is_empty() {
-            return Err("ADMIN_USER_IDS задан, но не содержит корректных числовых user_id".into());
-        }
+        let admins = parse_id_list("ADMIN_USER_IDS");
+        validate_id_list("ADMIN_USER_IDS", &admins, "user_id")?;
 
         let llm_api_key = var_or("LLM_API_KEY", "");
         if llm_api_key.is_empty() {
             // Допустимо для локальных серверов без авторизации (Ollama и т.п.)
             tracing::warn!("LLM_API_KEY пуст — запросы пойдут без заголовка авторизации");
         }
+
+        let allowed_chats = parse_id_list("ALLOWED_CHATS");
+        validate_id_list("ALLOWED_CHATS", &allowed_chats, "chat_id")?;
+
+        let allowed_threads = parse_id_list("ALLOWED_THREADS");
+        validate_id_list("ALLOWED_THREADS", &allowed_threads, "thread_id")?;
 
         Ok(Config {
             bot_token,
@@ -78,6 +104,46 @@ impl Config {
             admins,
             max_reply_tokens: max_reply_tokens.clamp(64, 16_000),
             temperature: temperature.clamp(0.0, 2.0),
+            allowed_chats,
+            allowed_threads,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_id_list_reads_comma_separated() {
+        std::env::set_var("KOSTUBETAI_TEST_IDS", "123, -456 ,789");
+        let set = parse_id_list("KOSTUBETAI_TEST_IDS");
+        assert!(set.contains(&123));
+        assert!(set.contains(&-456));
+        assert!(set.contains(&789));
+        assert_eq!(set.len(), 3);
+        std::env::remove_var("KOSTUBETAI_TEST_IDS");
+    }
+
+    #[test]
+    fn parse_id_list_empty_when_unset() {
+        std::env::remove_var("KOSTUBETAI_TEST_NONE");
+        assert!(parse_id_list("KOSTUBETAI_TEST_NONE").is_empty());
+    }
+
+    #[test]
+    fn validate_id_list_rejects_garbage() {
+        std::env::set_var("KOSTUBETAI_TEST_GARBAGE", "abc, def");
+        let set = parse_id_list("KOSTUBETAI_TEST_GARBAGE");
+        let err = validate_id_list("KOSTUBETAI_TEST_GARBAGE", &set, "x");
+        assert!(err.is_err());
+        std::env::remove_var("KOSTUBETAI_TEST_GARBAGE");
+    }
+
+    #[test]
+    fn validate_id_list_ok_when_unset() {
+        std::env::remove_var("KOSTUBETAI_TEST_NONE2");
+        let set = parse_id_list("KOSTUBETAI_TEST_NONE2");
+        assert!(validate_id_list("KOSTUBETAI_TEST_NONE2", &set, "x").is_ok());
     }
 }

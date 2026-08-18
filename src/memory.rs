@@ -2,11 +2,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::config::Config;
 use crate::db::MemoryStore;
-use crate::llm::{ChatMessage, LlmClient};
+use crate::llm::{ChatMessage, LlmClient, LlmSettings};
 use crate::text::meaningful_words;
 
 /// Сколько символов релевантных выдержек из гайдов максимум подмешивается в контекст.
 const GUIDE_CONTEXT_CHARS: usize = 4000;
+
+/// Ключи настроек в таблице `settings`, переопределяющие конфиг из .env.
+pub const SETTING_BASE_URL: &str = "llm_base_url";
+pub const SETTING_API_KEY: &str = "llm_api_key";
+pub const SETTING_MODEL: &str = "llm_model";
 
 fn build_system_prompt(guide_hits: &[(String, String)]) -> String {
     let mut prompt = String::from(
@@ -97,9 +102,11 @@ impl MemoryManager {
             }
         }
 
+        // Эффективные настройки: переопределение из БД (админ-панель) либо .env.
+        let settings = self.effective_settings();
         let answer = self
             .llm
-            .chat(&messages, self.cfg.max_reply_tokens, self.cfg.temperature)
+            .chat(&settings, &messages, self.cfg.max_reply_tokens, self.cfg.temperature)
             .await
             .map_err(|e| format!("{e}"))?;
 
@@ -171,6 +178,71 @@ impl MemoryManager {
 
     pub fn user_memory_tokens(&self) -> usize {
         self.cfg.user_memory_tokens
+    }
+
+    // ===== Настройки LLM (админ-панель) =====
+
+    /// Эффективные настройки: значение из БД, если задано, иначе дефолт из .env.
+    pub fn effective_settings(&self) -> LlmSettings {
+        let store = self.store();
+        let base_url = store
+            .get_setting(SETTING_BASE_URL)
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.cfg.llm_base_url.clone());
+        let api_key = store
+            .get_setting(SETTING_API_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.cfg.llm_api_key.clone());
+        let model = store
+            .get_setting(SETTING_MODEL)
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.cfg.llm_model.clone());
+        LlmSettings { base_url, api_key, model }
+    }
+
+    /// Снимок настроек для команды /settings: (поля, переопределённые ключи).
+    pub fn settings_snapshot(&self) -> SettingsSnapshot {
+        let eff = self.effective_settings();
+        let store = self.store();
+        let overridden: Vec<String> = store.all_settings().unwrap_or_default();
+        SettingsSnapshot {
+            base_url: eff.base_url,
+            api_key: eff.api_key,
+            model: eff.model,
+            default_base_url: self.cfg.llm_base_url.clone(),
+            default_model: self.cfg.llm_model.clone(),
+            overridden,
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.store().set_setting(key, value).map_err(|e| e.to_string())
+    }
+
+    pub fn reset_setting(&self, key: &str) -> Result<bool, String> {
+        self.store().delete_setting(key).map_err(|e| e.to_string())
+    }
+}
+
+/// Снимок настроек для отображения в /settings.
+pub struct SettingsSnapshot {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub default_base_url: String,
+    pub default_model: String,
+    /// Ключи, переопределённые в БД (llm_base_url, llm_api_key, llm_model).
+    pub overridden: Vec<String>,
+}
+
+impl SettingsSnapshot {
+    pub fn is_overridden(&self, key: &str) -> bool {
+        self.overridden.iter().any(|k| k == key)
     }
 }
 

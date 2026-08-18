@@ -49,7 +49,7 @@ async fn main() {
 
     let manager = MemoryManager::new(
         Arc::new(Mutex::new(store)),
-        LlmClient::new(cfg.llm_base_url.clone(), cfg.llm_api_key.clone(), cfg.llm_model.clone()),
+        LlmClient::new(),
         cfg.clone(),
     );
 
@@ -86,19 +86,24 @@ async fn main() {
     let msg_state = state.clone();
 
     let handler = Update::filter_message()
-        .filter_command::<handlers::Command>()
-        .endpoint(move |bot: Bot, msg: Message, cmd: handlers::Command| {
-            let state = cmd_state.clone();
-            async move { handlers::cmd_handler(bot, msg, cmd, state).await }
-        })
         .branch(
-            Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
+            dptree::entry()
+                .filter_command::<handlers::Command>()
+                .endpoint(move |bot: Bot, msg: Message, cmd: handlers::Command| {
+                    let state = cmd_state.clone();
+                    async move { handlers::cmd_handler(bot, msg, cmd, state).await }
+                }),
+        )
+        .branch(
+            dptree::endpoint(move |bot: Bot, msg: Message| {
                 let state = msg_state.clone();
                 async move { handlers::on_message(bot, msg, state).await }
             }),
         );
 
-    let mut dispatcher = Dispatcher::builder(bot, handler).build();
+    let mut dispatcher = Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![me])
+        .build();
     tokio::select! {
         _ = dispatcher.dispatch() => {}
         _ = shutdown_signal() => tracing::info!("получен сигнал остановки — завершаю работу"),

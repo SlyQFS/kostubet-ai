@@ -33,8 +33,23 @@ impl std::fmt::Display for LlmError {
         match self {
             LlmError::Http(e) => write!(f, "сетевая ошибка: {e}"),
             LlmError::Api { status, body } => {
-                let short: String = body.chars().take(300).collect();
-                write!(f, "API вернул ошибку {status}: {short}")
+                let clean_msg = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| {
+                                e.get("message")
+                                    .and_then(|m| m.as_str())
+                                    .or_else(|| e.as_str())
+                            })
+                            .map(str::to_string)
+                    });
+                if let Some(msg) = clean_msg {
+                    write!(f, "API вернул ошибку {status}: {msg}")
+                } else {
+                    let short: String = body.chars().take(300).collect();
+                    write!(f, "API вернул ошибку {status}: {short}")
+                }
             }
             LlmError::Parse(e) => write!(f, "не удалось разобрать ответ: {e}"),
             LlmError::Empty => write!(f, "модель вернула пустой ответ"),
@@ -44,14 +59,20 @@ impl std::fmt::Display for LlmError {
 
 impl std::error::Error for LlmError {}
 
+/// Параметры подключения к LLM API. Могут переопределяться из админ-панели
+/// (хранятся в БД), поэтому передаются в каждый вызов, а не фиксируются в клиенте.
+#[derive(Clone, Debug)]
+pub struct LlmSettings {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 /// Минимальный клиент для любого OpenAI-совместимого `/chat/completions`
 /// (OpenAI, OpenRouter, Ollama, vLLM, ...).
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model: String,
 }
 
 #[derive(Serialize)]
@@ -79,23 +100,43 @@ struct RespMessage {
 }
 
 impl LlmClient {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+    pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(180))
             .build()
             .expect("не удалось создать HTTP-клиент");
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model }
+        Self { http }
     }
 
-    pub async fn chat(&self, messages: &[ChatMessage], max_tokens: u32, temperature: f32) -> Result<String, LlmError> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = ChatRequest { model: &self.model, messages, max_tokens, temperature };
+    /// Нормализует базовый URL к виду эндпоинта /chat/completions.
+    pub fn build_chat_url(base_url: &str) -> String {
+        let base = base_url.trim().trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else {
+            format!("{base}/chat/completions")
+        }
+    }
+
+    pub async fn chat(
+        &self,
+        settings: &LlmSettings,
+        messages: &[ChatMessage],
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<String, LlmError> {
+        let url = Self::build_chat_url(&settings.base_url);
+        let body = ChatRequest { model: &settings.model, messages, max_tokens, temperature };
 
         let mut request = self.http.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            request = request.bearer_auth(&self.api_key);
+        if !settings.api_key.is_empty() {
+            request = request.bearer_auth(&settings.api_key);
         }
+        // Заголовки для совместимости с OpenRouter и внешними шлюзами
+        request = request
+            .header("HTTP-Referer", "https://github.com/SlyQFS/kostubet-ai")
+            .header("X-Title", "KostubetAI");
 
         let response = request.send().await.map_err(LlmError::Http)?;
         let status = response.status();
@@ -115,5 +156,39 @@ impl LlmClient {
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .ok_or(LlmError::Empty)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_chat_url_normalizes_paths() {
+        assert_eq!(
+            LlmClient::build_chat_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            LlmClient::build_chat_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            LlmClient::build_chat_url("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            LlmClient::build_chat_url("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_error_extracts_json_message() {
+        let err = LlmError::Api {
+            status: 401,
+            body: r#"{"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}}"#.into(),
+        };
+        assert_eq!(err.to_string(), "API вернул ошибку 401: Incorrect API key provided");
     }
 }

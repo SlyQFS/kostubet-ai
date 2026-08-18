@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS guide_chunks (
     content     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_guide ON guide_chunks(guide_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 const CHUNK_TARGET_CHARS: usize = 1200;
@@ -100,6 +105,7 @@ impl MemoryStore {
             }
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode возвращает строку с результатом, поэтому через query_row
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL;", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -202,7 +208,7 @@ impl MemoryStore {
 
     // ===== Гайды =====
 
-    pub fn add_guide(&self, title: &str, added_by: i64, content: &str) -> Result<usize, AddGuideError> {
+    pub fn add_guide(&mut self, title: &str, added_by: i64, content: &str) -> Result<usize, AddGuideError> {
         let title = title.trim();
         if title.is_empty() || content.trim().is_empty() {
             return Err(AddGuideError::Empty);
@@ -217,21 +223,21 @@ impl MemoryStore {
         }
 
         let chunks = split_chunks(content, CHUNK_TARGET_CHARS, CHUNK_HARD_LIMIT_CHARS);
-        self.conn
-            .execute(
-                "INSERT INTO guides(title, added_by, created_at) VALUES(?1, ?2, ?3)",
-                params![title, added_by, unix_now()],
+        let tx = self.conn.transaction().map_err(AddGuideError::Db)?;
+        tx.execute(
+            "INSERT INTO guides(title, added_by, created_at) VALUES(?1, ?2, ?3)",
+            params![title, added_by, unix_now()],
+        )
+        .map_err(AddGuideError::Db)?;
+        let guide_id = tx.last_insert_rowid();
+        for (index, chunk) in chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO guide_chunks(guide_id, chunk_index, content) VALUES(?1, ?2, ?3)",
+                params![guide_id, index as i64, chunk],
             )
             .map_err(AddGuideError::Db)?;
-        let guide_id = self.conn.last_insert_rowid();
-        for (index, chunk) in chunks.iter().enumerate() {
-            self.conn
-                .execute(
-                    "INSERT INTO guide_chunks(guide_id, chunk_index, content) VALUES(?1, ?2, ?3)",
-                    params![guide_id, index as i64, chunk],
-                )
-                .map_err(AddGuideError::Db)?;
         }
+        tx.commit().map_err(AddGuideError::Db)?;
         Ok(chunks.len())
     }
 
@@ -308,9 +314,11 @@ impl MemoryStore {
         let mut scored: Vec<(usize, i64, String, String)> = Vec::new();
         for row in rows {
             let (title, index, chunk) = row?;
-            let score = meaningful_words(&chunk).intersection(query_words).count();
-            if score > 0 {
-                scored.push((score, index, title, chunk));
+            let title_score = meaningful_words(&title).intersection(query_words).count() * 2;
+            let chunk_score = meaningful_words(&chunk).intersection(query_words).count();
+            let total_score = title_score + chunk_score;
+            if total_score > 0 {
+                scored.push((total_score, index, title, chunk));
             }
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -329,6 +337,38 @@ impl MemoryStore {
             }
         }
         Ok(selected)
+    }
+
+    // ===== Настройки (переопределяемые из админ-панели) =====
+
+    /// Возвращает значение настройки по ключу, если она задана.
+    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+    }
+
+    /// Записывает настройку (вставляет или обновляет существующую).
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Удаляет настройку по ключу. Возвращает true, если она существовала.
+    pub fn delete_setting(&self, key: &str) -> rusqlite::Result<bool> {
+        let deleted = self.conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(deleted > 0)
+    }
+
+    /// Возвращает список всех сохранённых ключей (для команды /settings).
+    pub fn all_settings(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT key FROM settings ORDER BY key")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
     }
 
     // ===== Общая статистика и лимит =====
@@ -372,6 +412,9 @@ impl MemoryStore {
     /// 2) урезать историю всех до ~100 токенов;
     /// 3) удалить истории всех, кроме 500 самых недавно активных;
     /// 4) удалять самые старые гайды (до 50 за один вызов).
+    ///
+    /// 5 — даже после всех этапов уложиться не удалось (превысит лимит на
+    /// следующем сообщении и повторит очистку).
     pub fn enforce_limit(&mut self, limit_bytes: u64) -> rusqlite::Result<u8> {
         // Цель — 95% лимита, чтобы чистка не запускалась на каждом сообщении.
         let soft_limit = limit_bytes - limit_bytes / 20;
@@ -402,25 +445,25 @@ impl MemoryStore {
             return Ok(3);
         }
 
-        let mut deleted = 0;
-        while deleted < 50 {
-            let oldest: Option<i64> = self
-                .conn
-                .query_row("SELECT guide_id FROM guides ORDER BY created_at, guide_id LIMIT 1", [], |r| r.get(0))
-                .optional()?;
-            match oldest {
-                Some(id) => {
-                    self.conn.execute("DELETE FROM guides WHERE guide_id = ?1", params![id])?;
-                    deleted += 1;
-                }
-                None => break,
-            }
-            self.vacuum();
-            if self.db_disk_size() <= soft_limit {
-                return Ok(4);
-            }
+        // Этап 4: удаляем до 50 самых старых гайдов одним запросом, затем
+        // один VACUUM. VACUUM переписывает весь файл базы — на большой базе
+        // это дорого, поэтому делаем его один раз, а не после каждого гайда.
+        let deleted = self.conn.execute(
+            "DELETE FROM guides WHERE guide_id IN (
+                SELECT guide_id FROM guides ORDER BY created_at, guide_id LIMIT 50
+            )",
+            [],
+        )?;
+        if deleted == 0 {
+            return Ok(5);
         }
-        Ok(5)
+        tracing::info!(deleted, "удалены старые гайды для освобождения места");
+        self.vacuum();
+        if self.db_disk_size() <= soft_limit {
+            Ok(4)
+        } else {
+            Ok(5)
+        }
     }
 }
 
@@ -474,8 +517,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_crud() {
+        let store = temp_db("settings");
+        assert_eq!(store.get_setting("model").unwrap(), None);
+        store.set_setting("model", "gpt-4o").unwrap();
+        assert_eq!(store.get_setting("model").unwrap(), Some("gpt-4o".to_string()));
+        store.set_setting("model", "gpt-4o-mini").unwrap();
+        assert_eq!(store.get_setting("model").unwrap(), Some("gpt-4o-mini".to_string()));
+        assert_eq!(store.all_settings().unwrap(), vec!["model".to_string()]);
+        assert!(store.delete_setting("model").unwrap());
+        assert_eq!(store.get_setting("model").unwrap(), None);
+        assert!(!store.delete_setting("model").unwrap());
+    }
+
+    #[test]
     fn guides_lifecycle_and_search() {
-        let store = temp_db("guides");
+        let mut store = temp_db("guides");
         let rust_guide = "Гайд по Rust\n\nCargo — система сборки. Крейты подключаются в Cargo.toml.\n\n\
                           Ownership и borrow checker — основа безопасности памяти в Rust.";
         let cook_guide = "Кулинарный гайд\n\nБорщ варится из свёклы и капусты. Подавать со сметаной.";
@@ -533,7 +590,7 @@ mod tests {
         let stage = store.enforce_limit(60 * 1024).unwrap();
         let after = store.db_disk_size();
         assert!(after < before / 2, "чистка должна заметно уменьшить базу: {after} из {before}");
-        assert!(stage >= 1 && stage <= 3);
+        assert!((1..=3).contains(&stage));
         for user in 1..=3 {
             let (count, _) = store.user_stats(user).unwrap();
             // 3000 символов бюджета / ~310 символов на сообщение — не больше пары десятков.
