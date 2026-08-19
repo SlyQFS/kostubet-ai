@@ -28,6 +28,8 @@ pub struct Config {
     pub memory_limit_bytes: u64,
     /// Сколько токенов истории максимум помнится на одного пользователя.
     pub user_memory_tokens: usize,
+    /// Максимальный бюджет токенов для группового чата при 6+ участниках.
+    pub max_group_memory_tokens: usize,
     /// Пусто — управлять гайдами может любой; иначе только перечисленные user_id.
     pub admins: HashSet<i64>,
     pub max_reply_tokens: u32,
@@ -43,6 +45,10 @@ pub struct Config {
     pub default_system_prompt: String,
     /// Максимальное количество одновременных запросов к LLM (очередь).
     pub max_concurrent_requests: usize,
+    /// Сколько запросов к LLM разрешено одному пользователю за окно времени.
+    pub rate_limit_requests: usize,
+    /// Длина окна подсчёта частоты запросов в секундах.
+    pub rate_limit_window_secs: u64,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -94,6 +100,7 @@ impl Config {
         }
 
         let user_memory_tokens: usize = parse_num("USER_MEMORY_TOKENS", "5000")?;
+        let max_group_memory_tokens: usize = parse_num("MAX_GROUP_MEMORY_TOKENS", "40000")?;
         let max_reply_tokens: u32 = parse_num("MAX_REPLY_TOKENS", "1500")?;
         let temperature: f32 = parse_num("LLM_TEMPERATURE", "0.7")?;
 
@@ -114,6 +121,8 @@ impl Config {
 
         let default_system_prompt = var_or("DEFAULT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT);
         let max_concurrent_requests: usize = parse_num("MAX_CONCURRENT_REQUESTS", "3")?;
+        let rate_limit_requests: usize = parse_num("RATE_LIMIT_REQUESTS", "5")?;
+        let rate_limit_window_secs: u64 = parse_num("RATE_LIMIT_WINDOW_SECS", "600")?;
 
         Ok(Config {
             bot_token,
@@ -123,6 +132,7 @@ impl Config {
             database_path: var_or("DATABASE_PATH", "data/memory.db"),
             memory_limit_bytes: memory_limit_mb * 1024 * 1024,
             user_memory_tokens: user_memory_tokens.clamp(100, 200_000),
+            max_group_memory_tokens: max_group_memory_tokens.clamp(1_000, 200_000),
             admins,
             max_reply_tokens: max_reply_tokens.clamp(64, 16_000),
             temperature: temperature.clamp(0.0, 2.0),
@@ -130,6 +140,8 @@ impl Config {
             allowed_threads,
             default_system_prompt,
             max_concurrent_requests: max_concurrent_requests.clamp(1, 50),
+            rate_limit_requests: rate_limit_requests.clamp(1, 1000),
+            rate_limit_window_secs: rate_limit_window_secs.clamp(10, 86_400),
         })
     }
 }

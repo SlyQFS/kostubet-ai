@@ -113,9 +113,9 @@ pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppSta
                 bot.send_message(msg.chat.id, "🔒 Эта команда доступна только администратору бота.").await?;
                 return Ok(());
             }
-            match state.mgr.reset(user_id) {
+            match state.mgr.reset_chat(msg.chat.id.0) {
                 Ok(()) => {
-                    bot.send_message(msg.chat.id, "🧠 Готово: память о диалоге очищена. Гайды сохранены — список: /guides").await?;
+                    bot.send_message(msg.chat.id, "🧠 Готово: память чата очищена. Гайды сохранены — список: /guides").await?;
                 }
                 Err(e) => {
                     tracing::error!("ошибка сброса памяти: {e}");
@@ -128,19 +128,20 @@ pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppSta
                 bot.send_message(msg.chat.id, "🔒 Эта команда доступна только администратору бота.").await?;
                 return Ok(());
             }
-            let snap = state.mgr.user_snapshot(user_id);
-            let budget = state.mgr.user_memory_tokens();
+            let snap = state.mgr.chat_snapshot(msg.chat.id.0);
             let (size, total_msgs, users, guides) = state.mgr.global_stats();
-            let percent_user = if budget > 0 { snap.est_tokens as f64 / budget as f64 * 100.0 } else { 0.0 };
+            let percent_chat = if snap.budget > 0 { snap.est_tokens as f64 / snap.budget as f64 * 100.0 } else { 0.0 };
             let percent_db = if state.cfg.memory_limit_bytes > 0 { size as f64 / state.cfg.memory_limit_bytes as f64 * 100.0 } else { 0.0 };
             let text = format!(
-                "👤 Твоя память: {} сообщений, ~{} из {} токенов ({:.0}%)\n\
+                "💬 Память чата: {} сообщений, ~{} из {} токенов ({:.0}%)\n\
+                 👥 Участников диалога: {}\n\
                  💾 База всего: {} из {} ({:.1}%), сообщений: {}, пользователей: {}, гайдов: {}\n\n\
                  История хранится дословно, без искажающих суммаризаций.",
                 snap.message_count,
                 snap.est_tokens,
-                budget,
-                percent_user,
+                snap.budget,
+                percent_chat,
+                snap.participants,
                 fmt_bytes(size),
                 fmt_bytes(state.cfg.memory_limit_bytes),
                 percent_db,
@@ -181,6 +182,7 @@ pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppSta
 
 pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or_default();
+    let display_name = msg.from.as_ref().map(extract_display_name).unwrap_or_default();
 
     if !is_allowed(&state, &msg) {
         tracing::debug!(user_id, chat_id = msg.chat.id.0, "сообщение отфильтровано: чат или топик не в белом списке");
@@ -234,6 +236,29 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         return Ok(());
     }
     let user_text = if clean.is_empty() { "Привет!".to_string() } else { clean };
+
+    // Частотный лимит: не более N запросов за окно времени на пользователя.
+    // Предотвращает монополизацию очереди одним пользователем, пока бот
+    // генерирует ответ — остальные получают свои ответы без задержек.
+    if !state.mgr.check_rate_limit(user_id).await {
+        let max = state.mgr.rate_limit_max();
+        let window_min = state.mgr.rate_limit_window_secs() / 60;
+        tracing::info!(
+            user_id,
+            max, window_min,
+            "запрос отклонён: превышен частотный лимит"
+        );
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "⏳ Слишком частые запросы! Лимит — {max} сообщений за {} мин. Подожди немного и попробуй снова.",
+                if window_min > 0 { window_min } else { 1 },
+            ),
+        )
+        .reply_parameters(ReplyParameters::new(msg.id))
+        .await?;
+        return Ok(());
+    }
 
     tracing::info!(user_id, "отправка запроса в LLM (прогрессивный стриминг)...");
     let typing = spawn_typing(bot.clone(), msg.chat.id);
@@ -292,7 +317,7 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         }
     });
 
-    let answer = state.mgr.reply_stream(user_id, &user_text, on_delta).await;
+    let answer = state.mgr.reply_stream(user_id, chat_id.0, &display_name, &user_text, on_delta).await;
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = update_task.await;
     typing.abort();
@@ -364,6 +389,23 @@ pub fn manual_command_args<'a>(text: &'a str, name: &str, bot_username: Option<&
 
 pub fn is_admin(state: &AppState, user_id: i64) -> bool {
     state.cfg.admins.is_empty() || state.cfg.admins.contains(&user_id)
+}
+
+/// Извлекает отображаемое имя пользователя для атрибуции в полу-разделяемой памяти.
+fn extract_display_name(u: &teloxide::types::User) -> String {
+    let name = if let Some(last) = &u.last_name {
+        format!("{} {}", u.first_name, last)
+    } else {
+        u.first_name.clone()
+    };
+    let name = name.trim();
+    if !name.is_empty() {
+        name.to_string()
+    } else if let Some(username) = &u.username {
+        format!("@{username}")
+    } else {
+        format!("User{}", u.id)
+    }
 }
 
 async fn handle_summary(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
@@ -621,7 +663,8 @@ fn is_allowed(state: &AppState, msg: &Message) -> bool {
 }
 
 /// В приватных чатах (ЛС) нейросетью не отвечаем (доступны только команды);
-/// в группах — отвечаем при упоминании @бота, ответе (reply) на сообщение бота или цитировании.
+/// в группах — отвечаем при упоминании @бота, простом ответе (reply) на сообщение
+/// бота или цитировании его сообщения.
 pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, String) {
     if msg.chat.is_private() {
         return (false, String::new());
@@ -649,7 +692,8 @@ pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, Strin
         clean = words_out.join(" ");
     }
 
-    // 2. Проверка ответа (reply) на сообщение бота
+    // 2. Проверка ответа (reply) на сообщение бота — покрывает как простые
+    //    ответы, так и ответы с цитированием (quote — это частный случай reply).
     let replied_to_bot = if let Some(reply) = msg.reply_to_message() {
         let from_bot = reply
             .from
@@ -681,11 +725,8 @@ pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, Strin
         false
     };
 
-    // 3. Проверка цитирования (quotes)
-    let quoted_bot = msg.quote().is_some() && replied_to_bot;
-
     let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    (mentioned || replied_to_bot || quoted_bot, clean)
+    (mentioned || replied_to_bot, clean)
 }
 
 // ===== Админ-панель: настройки API, модели и промпта =====

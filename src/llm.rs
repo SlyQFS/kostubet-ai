@@ -6,17 +6,23 @@ use std::time::Duration;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self { role: "system".into(), content: content.into(), name: None }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), name: None }
+    }
+    pub fn user_named(name: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: content.into(), name: Some(name.into()) }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), content: content.into(), name: None }
     }
 }
 

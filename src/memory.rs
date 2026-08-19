@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
@@ -17,6 +18,52 @@ pub const SETTING_API_KEY: &str = "llm_api_key";
 pub const SETTING_MODEL: &str = "llm_model";
 pub const SETTING_SYSTEM_PROMPT: &str = "system_prompt";
 
+/// Ограничитель частоты запросов: не более `max_requests` обращений к LLM
+/// за `window` от каждого пользователя. Предотвращает монополизацию очереди
+/// одним пользователем и гарантирует, что пока бот генерирует ответ для
+/// одного собеседника, залповый спам от него не забивает очередь —
+/// остальные пользователи получают ответы вовремя.
+#[derive(Clone)]
+pub struct RateLimiter {
+    requests: Arc<TokioMutex<HashMap<i64, Vec<Instant>>>>,
+    max_requests: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            requests: Arc::new(TokioMutex::new(HashMap::new())),
+            max_requests,
+            window,
+        }
+    }
+
+    /// Атомарно проверяет и регистрирует запрос. Возвращает `true`, если
+    /// запрос разрешён (и записывает метку времени), `false` — если лимит исчерпан.
+    pub async fn check_and_record(&self, user_id: i64) -> bool {
+        let mut requests = self.requests.lock().await;
+        let now = Instant::now();
+        let user_requests = requests.entry(user_id).or_default();
+        user_requests.retain(|t| now.saturating_duration_since(*t) < self.window);
+        if user_requests.len() >= self.max_requests {
+            return false;
+        }
+        user_requests.push(now);
+        true
+    }
+
+    /// Сколько запросов ещё доступно пользователю в текущем окне.
+    #[allow(dead_code)]
+    pub async fn remaining(&self, user_id: i64) -> usize {
+        let mut requests = self.requests.lock().await;
+        let now = Instant::now();
+        let user_requests = requests.entry(user_id).or_default();
+        user_requests.retain(|t| now.saturating_duration_since(*t) < self.window);
+        self.max_requests.saturating_sub(user_requests.len())
+    }
+}
+
 pub fn build_system_prompt(base_prompt: &str, guide_hits: &[(String, String)]) -> String {
     let mut prompt = base_prompt.trim().to_string();
     if !guide_hits.is_empty() {
@@ -31,35 +78,46 @@ pub fn build_system_prompt(base_prompt: &str, guide_hits: &[(String, String)]) -
     prompt
 }
 
-/// Память одного пользователя для команды /memory.
-pub struct UserSnapshot {
+/// Память чата для команды /memory.
+pub struct ChatSnapshot {
     pub message_count: i64,
     pub est_tokens: usize,
+    pub participants: usize,
+    pub budget: usize,
 }
 
 /// Менеджер памяти и очереди запросов.
-/// Хранит для каждого пользователя только дословную историю последних сообщений,
-/// управляет очередью и защищает от перегрузок через семафор параллельности и блокировку на пользователя.
+/// Хранит полу-разделяемую дословную историю сообщений по чатам: все участники
+/// группового чата видят общий контекст. Бюджет токенов масштабируется по
+/// числу участников (1 → base, 6+ → max). Очередь защищена семафором
+/// параллельности и блокировкой на чат (запросы из одного чата идут строго
+/// последовательно, чтобы не гоняться за общую историю).
 #[derive(Clone)]
 pub struct MemoryManager {
     store: Arc<Mutex<MemoryStore>>,
     llm: LlmClient,
     cfg: Arc<Config>,
     semaphore: Arc<Semaphore>,
-    user_locks: Arc<TokioMutex<HashMap<i64, Arc<TokioMutex<()>>>>>,
-    last_request_time: Arc<TokioMutex<std::time::Instant>>,
+    chat_locks: Arc<TokioMutex<HashMap<i64, Arc<TokioMutex<()>>>>>,
+    last_request_time: Arc<TokioMutex<Instant>>,
+    rate_limiter: RateLimiter,
 }
 
 impl MemoryManager {
     pub fn new(store: Arc<Mutex<MemoryStore>>, llm: LlmClient, cfg: Arc<Config>) -> Self {
         let max_concurrent = cfg.max_concurrent_requests;
+        let rate_limiter = RateLimiter::new(
+            cfg.rate_limit_requests,
+            Duration::from_secs(cfg.rate_limit_window_secs),
+        );
         Self {
             store,
             llm,
             cfg,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            user_locks: Arc::new(TokioMutex::new(HashMap::new())),
-            last_request_time: Arc::new(TokioMutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10))),
+            chat_locks: Arc::new(TokioMutex::new(HashMap::new())),
+            last_request_time: Arc::new(TokioMutex::new(Instant::now() - Duration::from_secs(10))),
+            rate_limiter,
         }
     }
 
@@ -67,23 +125,75 @@ impl MemoryManager {
         self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Получает мьютекс для конкретного пользователя, чтобы его запросы обрабатывались строго последовательно.
-    async fn user_lock(&self, user_id: i64) -> Arc<TokioMutex<()>> {
-        let mut locks = self.user_locks.lock().await;
+    /// Блокировка на чат: пока бот генерирует ответ, другие сообщения из
+    /// этого же чата ждут очереди (память-то полу-разделяемая).
+    async fn chat_lock(&self, chat_id: i64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.chat_locks.lock().await;
         locks
-            .entry(user_id)
+            .entry(chat_id)
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
     }
 
-    /// Синхронная/нестриминговая обёртка над reply_stream.
-    #[allow(dead_code)]
-    pub async fn reply(&self, user_id: i64, text: &str) -> Result<String, String> {
-        self.reply_stream(user_id, text, |_| {}).await
+    /// Прогрессия бюджета токенов по числу участников:
+    /// 1 участник → base (USER_MEMORY_TOKENS), 6+ → max (MAX_GROUP_MEMORY_TOKENS).
+    /// Линейная прогрессия с шагом (max - base) / 5.
+    pub fn compute_chat_token_budget(&self, participants: usize) -> usize {
+        let base = self.cfg.user_memory_tokens;
+        let max = self.cfg.max_group_memory_tokens;
+        if participants <= 1 || max <= base {
+            return base;
+        }
+        let step = (max - base) / 5;
+        let budget = base + (participants - 1) * step;
+        budget.min(max)
     }
 
-    /// Стриминговая генерация ответа с передачей инкрементов текста через callback on_delta.
-    pub async fn reply_stream<F>(&self, user_id: i64, text: &str, on_delta: F) -> Result<String, String>
+    /// Проверяет и регистрирует запрос пользователя в рамках частотного лимита.
+    /// Возвращает `true` — запрос разрешён, `false` — лимит исчерпан.
+    pub async fn check_rate_limit(&self, user_id: i64) -> bool {
+        self.rate_limiter.check_and_record(user_id).await
+    }
+
+    /// Сколько запросов ещё доступно пользователю в текущем окне.
+    #[allow(dead_code)]
+    pub async fn rate_limit_remaining(&self, user_id: i64) -> usize {
+        self.rate_limiter.remaining(user_id).await
+    }
+
+    /// Возвращает настроенный лимит запросов на пользователя.
+    pub fn rate_limit_max(&self) -> usize {
+        self.cfg.rate_limit_requests
+    }
+
+    /// Возвращает длину окна частотного лимита в секундах.
+    pub fn rate_limit_window_secs(&self) -> u64 {
+        self.cfg.rate_limit_window_secs
+    }
+
+    /// Синхронная/нестриминговая обёртка над reply_stream.
+    #[allow(dead_code)]
+    pub async fn reply(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        display_name: &str,
+        text: &str,
+    ) -> Result<String, String> {
+        self.reply_stream(user_id, chat_id, display_name, text, |_| {}).await
+    }
+
+    /// Стриминговая генерация ответа с полу-разделяемой памятью чата.
+    /// Бюджет токенов масштабируется по числу участников; все сообщения
+    /// участников чата попадают в общий контекст LLM.
+    pub async fn reply_stream<F>(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        display_name: &str,
+        text: &str,
+        on_delta: F,
+    ) -> Result<String, String>
     where
         F: FnMut(&str) + Send,
     {
@@ -95,27 +205,31 @@ impl MemoryManager {
             text.to_string()
         };
 
-        // Захватываем блокировку пользователя для защиты от параллельного спама одного юзера
-        let u_lock = self.user_lock(user_id).await;
-        let _user_guard = u_lock.lock().await;
+        // Блокировка на чат: пока генерируется ответ, другие сообщения из
+        // этого же чата ждут — они работают с той же историей.
+        let c_lock = self.chat_lock(chat_id).await;
+        let _chat_guard = c_lock.lock().await;
 
         // Сохраняем входящее сообщение до сетевого вызова
         {
             let store = self.store();
             store
-                .add_message(user_id, "user", &user_content)
+                .add_message(user_id, chat_id, display_name, "user", &user_content)
                 .map_err(|e| format!("ошибка базы данных: {e}"))?;
         }
 
-        let (history, guide_hits) = {
+        // Вычисляем масштабированный бюджет по числу участников чата
+        let (history, guide_hits, budget) = {
             let store = self.store();
+            let participants = store.chat_participant_count(chat_id).unwrap_or(1).max(1);
+            let budget = self.compute_chat_token_budget(participants);
             let history = store
-                .user_messages_within_tokens(user_id, self.cfg.user_memory_tokens)
+                .chat_messages_within_tokens(chat_id, budget)
                 .map_err(|e| format!("ошибка базы данных: {e}"))?;
             let guide_hits = store
                 .search_guide_chunks(&meaningful_words(&user_content), GUIDE_CONTEXT_CHARS)
                 .unwrap_or_default();
-            (history, guide_hits)
+            (history, guide_hits, budget)
         };
 
         let base_prompt = self.effective_system_prompt();
@@ -124,6 +238,8 @@ impl MemoryManager {
         for m in history {
             if m.role == "assistant" {
                 messages.push(ChatMessage::assistant(m.content));
+            } else if let Some(name) = m.display_name.filter(|n| !n.is_empty()) {
+                messages.push(ChatMessage::user_named(name, m.content));
             } else {
                 messages.push(ChatMessage::user(m.content));
             }
@@ -142,12 +258,12 @@ impl MemoryManager {
         // Пейсер запросов: сглаживает залповые вопросы (burst), предотвращая 403 и 429 от WAF
         {
             let mut last = self.last_request_time.lock().await;
-            let min_interval = std::time::Duration::from_millis(1500);
+            let min_interval = Duration::from_millis(1500);
             let elapsed = last.elapsed();
             if elapsed < min_interval {
                 tokio::time::sleep(min_interval - elapsed).await;
             }
-            *last = std::time::Instant::now();
+            *last = Instant::now();
         }
 
         let answer = self
@@ -162,14 +278,14 @@ impl MemoryManager {
         {
             let store = self.store();
             store
-                .add_message(user_id, "assistant", answer.trim())
+                .add_message(user_id, chat_id, "", "assistant", answer.trim())
                 .map_err(|e| format!("ошибка базы данных: {e}"))?;
-            match store.trim_user_history(user_id, self.cfg.user_memory_tokens) {
+            match store.trim_chat_history(chat_id, budget) {
                 Ok(deleted) if deleted > 0 => {
-                    tracing::debug!(user_id, deleted, "старые сообщения вышли за лимит памяти и удалены");
+                    tracing::debug!(chat_id, deleted, "старые сообщения вышли за лимит памяти и удалены");
                 }
                 Ok(_) => {}
-                Err(e) => tracing::warn!("не удалось обрезать историю пользователя {user_id}: {e}"),
+                Err(e) => tracing::warn!("не удалось обрезать историю чата {chat_id}: {e}"),
             }
         }
 
@@ -189,13 +305,20 @@ impl MemoryManager {
         }
     }
 
-    pub fn reset(&self, user_id: i64) -> Result<(), String> {
-        self.store().reset_user(user_id).map_err(|e| e.to_string())
+    pub fn reset_chat(&self, chat_id: i64) -> Result<(), String> {
+        self.store().reset_chat(chat_id).map_err(|e| e.to_string())
     }
 
-    pub fn user_snapshot(&self, user_id: i64) -> UserSnapshot {
-        let (message_count, est_tokens) = self.store().user_stats(user_id).unwrap_or((0, 0));
-        UserSnapshot { message_count, est_tokens }
+    pub fn chat_snapshot(&self, chat_id: i64) -> ChatSnapshot {
+        let (message_count, est_tokens, participants) =
+            self.store().chat_stats(chat_id).unwrap_or((0, 0, 0));
+        let budget = self.compute_chat_token_budget(participants);
+        ChatSnapshot {
+            message_count,
+            est_tokens,
+            participants,
+            budget,
+        }
     }
 
     /// (размер базы на диске, всего сообщений, всего пользователей, гайдов)
@@ -225,6 +348,7 @@ impl MemoryManager {
         self.store().add_guide(title, added_by, content).map_err(|e| e.to_string())
     }
 
+    #[allow(dead_code)]
     pub fn user_memory_tokens(&self) -> usize {
         self.cfg.user_memory_tokens
     }
@@ -325,5 +449,71 @@ mod tests {
         assert!(with.starts_with(base));
         assert!(with.contains("Из гайда «rust»"));
         assert!(with.contains("Cargo.toml"));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_allows_up_to_limit() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        assert!(limiter.check_and_record(1).await);
+        assert!(limiter.check_and_record(1).await);
+        assert!(limiter.check_and_record(1).await);
+        // 4-й — превышение лимита
+        assert!(!limiter.check_and_record(1).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_isolates_users() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.check_and_record(1).await);
+        assert!(limiter.check_and_record(1).await);
+        assert!(!limiter.check_and_record(1).await);
+        // Пользователь 2 имеет отдельный лимит
+        assert!(limiter.check_and_record(2).await);
+        assert!(limiter.check_and_record(2).await);
+        assert!(!limiter.check_and_record(2).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_remaining_decrements() {
+        let limiter = RateLimiter::new(5, Duration::from_secs(60));
+        assert_eq!(limiter.remaining(42).await, 5);
+        limiter.check_and_record(42).await;
+        assert_eq!(limiter.remaining(42).await, 4);
+        limiter.check_and_record(42).await;
+        assert_eq!(limiter.remaining(42).await, 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_records_atomically() {
+        // Два параллельных запроса от одного пользователя с лимитом 1:
+        // только один должен пройти.
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        let (a, b) = tokio::join!(
+            limiter.check_and_record(99),
+            limiter.check_and_record(99),
+        );
+        assert!(a ^ b, "только один из двух запросов должен быть разрешён");
+    }
+
+    #[test]
+    fn chat_token_budget_progression() {
+        let base = 5000usize;
+        let max = 40000usize;
+        let step = (max - base) / 5;
+
+        let budget = |n: usize| -> usize {
+            if n <= 1 || max <= base {
+                return base;
+            }
+            (base + (n - 1) * step).min(max)
+        };
+
+        assert_eq!(budget(1), 5000);
+        assert_eq!(budget(2), 12000);
+        assert_eq!(budget(3), 19000);
+        assert_eq!(budget(4), 26000);
+        assert_eq!(budget(5), 33000);
+        assert_eq!(budget(6), 40000);
+        assert_eq!(budget(10), 40000, "capped at max");
     }
 }
