@@ -44,6 +44,13 @@ impl RateLimiter {
     pub async fn check_and_record(&self, user_id: i64) -> bool {
         let mut requests = self.requests.lock().await;
         let now = Instant::now();
+        // Периодическая очистка от неактивных пользователей при разрастании карты
+        if requests.len() > 1000 {
+            requests.retain(|_, timestamps| {
+                timestamps.retain(|t| now.saturating_duration_since(*t) < self.window);
+                !timestamps.is_empty()
+            });
+        }
         let user_requests = requests.entry(user_id).or_default();
         user_requests.retain(|t| now.saturating_duration_since(*t) < self.window);
         if user_requests.len() >= self.max_requests {
@@ -98,7 +105,6 @@ pub struct MemoryManager {
     llm: LlmClient,
     cfg: Arc<Config>,
     semaphore: Arc<Semaphore>,
-    chat_locks: Arc<TokioMutex<HashMap<i64, Arc<TokioMutex<()>>>>>,
     last_request_time: Arc<TokioMutex<Instant>>,
     rate_limiter: RateLimiter,
 }
@@ -115,7 +121,6 @@ impl MemoryManager {
             llm,
             cfg,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            chat_locks: Arc::new(TokioMutex::new(HashMap::new())),
             last_request_time: Arc::new(TokioMutex::new(Instant::now() - Duration::from_secs(10))),
             rate_limiter,
         }
@@ -123,16 +128,6 @@ impl MemoryManager {
 
     fn store(&self) -> MutexGuard<'_, MemoryStore> {
         self.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Блокировка на чат: пока бот генерирует ответ, другие сообщения из
-    /// этого же чата ждут очереди (память-то полу-разделяемая).
-    async fn chat_lock(&self, chat_id: i64) -> Arc<TokioMutex<()>> {
-        let mut locks = self.chat_locks.lock().await;
-        locks
-            .entry(chat_id)
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-            .clone()
     }
 
     /// Прогрессия бюджета токенов по числу участников:
@@ -144,7 +139,7 @@ impl MemoryManager {
         if participants <= 1 || max <= base {
             return base;
         }
-        let step = (max - base) / 5;
+        let step = ((max - base) / 5).max(1);
         let budget = base + (participants - 1) * step;
         budget.min(max)
     }
@@ -205,11 +200,6 @@ impl MemoryManager {
             text.to_string()
         };
 
-        // Блокировка на чат: пока генерируется ответ, другие сообщения из
-        // этого же чата ждут — они работают с той же историей.
-        let c_lock = self.chat_lock(chat_id).await;
-        let _chat_guard = c_lock.lock().await;
-
         // Сохраняем входящее сообщение до сетевого вызова
         {
             let store = self.store();
@@ -255,10 +245,10 @@ impl MemoryManager {
             .await
             .map_err(|_| "внутренняя ошибка очереди".to_string())?;
 
-        // Пейсер запросов: сглаживает залповые вопросы (burst), предотвращая 403 и 429 от WAF
+        // Пейсер запросов: сглаживает микро-всплески (burst)
         {
             let mut last = self.last_request_time.lock().await;
-            let min_interval = Duration::from_millis(1500);
+            let min_interval = Duration::from_millis(50);
             let elapsed = last.elapsed();
             if elapsed < min_interval {
                 tokio::time::sleep(min_interval - elapsed).await;

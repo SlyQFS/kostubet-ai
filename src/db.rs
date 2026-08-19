@@ -555,9 +555,7 @@ mod tests {
     fn migrate_old_schema_succeeds() {
         let path = std::env::temp_dir()
             .join(format!("kostubetai_test_{}_old_schema.db", std::process::id()));
-        for p in [&path] {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = std::fs::remove_file(&path);
         for suffix in ["-wal", "-shm"] {
             let mut os = path.clone().into_os_string();
             os.push(suffix);

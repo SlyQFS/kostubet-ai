@@ -120,9 +120,9 @@ impl Config {
         validate_id_list("ALLOWED_THREADS", &allowed_threads, "thread_id")?;
 
         let default_system_prompt = var_or("DEFAULT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT);
-        let max_concurrent_requests: usize = parse_num("MAX_CONCURRENT_REQUESTS", "3")?;
-        let rate_limit_requests: usize = parse_num("RATE_LIMIT_REQUESTS", "5")?;
-        let rate_limit_window_secs: u64 = parse_num("RATE_LIMIT_WINDOW_SECS", "600")?;
+        let max_concurrent_requests: usize = parse_num("MAX_CONCURRENT_REQUESTS", "5")?;
+        let rate_limit_requests: usize = parse_num("RATE_LIMIT_REQUESTS", "30")?;
+        let rate_limit_window_secs: u64 = parse_num("RATE_LIMIT_WINDOW_SECS", "60")?;
 
         Ok(Config {
             bot_token,

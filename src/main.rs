@@ -61,9 +61,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = bot.set_my_commands(handlers::bot_commands()).await {
-        tracing::warn!("не удалось зарегистрировать меню команд: {e}");
+    use teloxide::types::BotCommandScope;
+    if let Err(e) = bot
+        .set_my_commands(handlers::bot_commands())
+        .scope(BotCommandScope::AllPrivateChats)
+        .await
+    {
+        tracing::warn!("не удалось зарегистрировать меню команд для ЛС: {e}");
     }
+    let _ = bot.delete_my_commands().scope(BotCommandScope::AllGroupChats).await;
 
     let username = me.username.as_deref().map(str::to_owned);
     tracing::info!(

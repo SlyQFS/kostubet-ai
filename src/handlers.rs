@@ -48,30 +48,48 @@ pub struct AppState {
     pub http: reqwest::Client,
 }
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Команды KostubetAI:")]
+#[derive(BotCommands, Clone, Debug)]
+#[command(rename_rule = "snake_case", description = "Команды KostubetAI:")]
 pub enum Command {
     #[command(description = "приветствие и справка")]
     Start,
     #[command(description = "справка")]
     Help,
-    #[command(description = "очистить память о тебе (админ)")]
+    #[command(description = "очистить память чата (админ)")]
     Reset,
     #[command(description = "статистика памяти (админ)")]
     Memory,
     #[command(description = "список гайдов (админ)")]
     Guides,
+    #[command(description = "добавить гайд: /guide_add <название> (админ)")]
+    GuideAdd(String),
+    #[command(description = "удалить гайд: /guide_del <название или id> (админ)")]
+    GuideDel(String),
     #[command(description = "настройки API и модели (админ)")]
     Settings,
+    #[command(description = "задать модель: /set_model <название> (админ)")]
+    SetModel(String),
+    #[command(description = "задать адрес API: /set_api <url> (админ)")]
+    SetApi(String),
+    #[command(description = "задать API-ключ: /set_key <ключ> (админ)")]
+    SetKey(String),
+    #[command(description = "задать системный промпт: /set_prompt <текст> (админ)")]
+    SetPrompt(String),
+    #[command(description = "задать системный промпт (админ)")]
+    SetSystemPrompt(String),
+    #[command(description = "сбросить настройку: /reset_setting <название> (админ)")]
+    ResetSetting(String),
+    #[command(description = "суммаризация диалога")]
+    Summary,
 }
 
-/// Список команд для Telegram-меню (включая те, что разбираются вручную).
+/// Список команд для Telegram-меню в личных сообщениях.
 pub fn bot_commands() -> Vec<teloxide::types::BotCommand> {
     use teloxide::types::BotCommand;
     vec![
         BotCommand::new("start", "приветствие и справка"),
         BotCommand::new("help", "справка"),
-        BotCommand::new("reset", "очистить память (админ)"),
+        BotCommand::new("reset", "очистить память чата (админ)"),
         BotCommand::new("memory", "статистика памяти (админ)"),
         BotCommand::new("guides", "список гайдов (админ)"),
         BotCommand::new("guide_add", "добавить гайд ответом на сообщение (админ)"),
@@ -85,6 +103,15 @@ pub fn bot_commands() -> Vec<teloxide::types::BotCommand> {
     ]
 }
 
+/// Сообщение о переадресации команд из групп в личные сообщения.
+fn pm_redirect_message(bot_username: Option<&str>) -> String {
+    if let Some(username) = bot_username {
+        format!("ℹ️ Команды и настройки бота доступны только в личных сообщениях: @{username}")
+    } else {
+        "ℹ️ Команды и настройки бота доступны только в личных сообщениях с ботом.".to_string()
+    }
+}
+
 pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppState>) -> ResponseResult<()> {
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or_default();
     let admin = is_admin(&state, user_id);
@@ -94,12 +121,26 @@ pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppSta
         Command::Reset => "reset",
         Command::Memory => "memory",
         Command::Guides => "guides",
+        Command::GuideAdd(_) => "guide_add",
+        Command::GuideDel(_) => "guide_del",
         Command::Settings => "settings",
+        Command::SetModel(_) => "set_model",
+        Command::SetApi(_) => "set_api",
+        Command::SetKey(_) => "set_key",
+        Command::SetPrompt(_) | Command::SetSystemPrompt(_) => "set_prompt",
+        Command::ResetSetting(_) => "reset_setting",
+        Command::Summary => "summary",
     };
     tracing::info!(user_id, chat_id = msg.chat.id.0, admin, cmd = cmd_name, "обработка команды");
 
     if !is_allowed(&state, &msg) {
         tracing::info!(user_id, chat_id = msg.chat.id.0, "команда проигнорирована: чат или топик не в белом списке");
+        return Ok(());
+    }
+
+    // В группах все команды переадресуются в личные сообщения
+    if !msg.chat.is_private() {
+        bot.send_message(msg.chat.id, pm_redirect_message(state.bot_username.as_deref())).await?;
         return Ok(());
     }
 
@@ -169,12 +210,36 @@ pub async fn cmd_handler(bot: Bot, msg: Message, cmd: Command, state: Arc<AppSta
             };
             bot.send_message(msg.chat.id, text).await?;
         }
+        Command::GuideAdd(title) => {
+            handle_guide_add(bot, msg, &title, state).await?;
+        }
+        Command::GuideDel(query) => {
+            handle_guide_del(bot, msg, &query, state).await?;
+        }
         Command::Settings => {
             if !admin {
                 bot.send_message(msg.chat.id, "🔒 Настройки доступны только администратору бота.").await?;
                 return Ok(());
             }
             bot.send_message(msg.chat.id, format_settings(&state.mgr)).await?;
+        }
+        Command::SetModel(value) => {
+            handle_set_model(bot, msg, &value, state).await?;
+        }
+        Command::SetApi(value) => {
+            handle_set_api(bot, msg, &value, state).await?;
+        }
+        Command::SetKey(value) => {
+            handle_set_key(bot, msg, &value, state).await?;
+        }
+        Command::SetPrompt(value) | Command::SetSystemPrompt(value) => {
+            handle_set_prompt(bot, msg, &value, state).await?;
+        }
+        Command::ResetSetting(value) => {
+            handle_reset_setting(bot, msg, &value, state).await?;
+        }
+        Command::Summary => {
+            handle_summary(bot, msg, state).await?;
         }
     }
     Ok(())
@@ -193,41 +258,20 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         return handle_document(bot, msg, &doc, state).await;
     }
 
-    let Some(text) = msg.text().map(ToOwned::to_owned) else {
+    let text_opt = msg.text().or_else(|| msg.caption()).map(ToOwned::to_owned);
+    let Some(text) = text_opt else {
         return Ok(());
     };
 
     let text_preview: String = text.chars().take(40).collect();
     tracing::info!(user_id, chat_id = msg.chat.id.0, is_private = msg.chat.is_private(), text = %text_preview, "получено входящее сообщение");
 
-    let bot_username = state.bot_username.as_deref();
-
-    // Команды с аргументами разбираем вручную
-    if let Some(title) = manual_command_args(&text, "/guide_add", bot_username) {
-        return handle_guide_add(bot, msg, title, state).await;
-    }
-    if let Some(query) = manual_command_args(&text, "/guide_del", bot_username) {
-        return handle_guide_del(bot, msg, query, state).await;
-    }
-    if let Some(value) = manual_command_args(&text, "/set_model", bot_username) {
-        return handle_set_model(bot, msg, value, state).await;
-    }
-    if let Some(value) = manual_command_args(&text, "/set_api", bot_username) {
-        return handle_set_api(bot, msg, value, state).await;
-    }
-    if let Some(value) = manual_command_args(&text, "/set_key", bot_username) {
-        return handle_set_key(bot, msg, value, state).await;
-    }
-    if let Some(value) = manual_command_args(&text, "/set_prompt", bot_username)
-        .or_else(|| manual_command_args(&text, "/set_system_prompt", bot_username))
-    {
-        return handle_set_prompt(bot, msg, value, state).await;
-    }
-    if let Some(value) = manual_command_args(&text, "/reset_setting", bot_username) {
-        return handle_reset_setting(bot, msg, value, state).await;
-    }
-    if manual_command_args(&text, "/summary", bot_username).is_some() {
-        return handle_summary(bot, msg, state).await;
+    // Игнорируем неизвестные команды со слэшем в чатах
+    if text.starts_with('/') {
+        if !msg.chat.is_private() {
+            bot.send_message(msg.chat.id, pm_redirect_message(state.bot_username.as_deref())).await?;
+        }
+        return Ok(());
     }
 
     let (should_reply, clean) = should_reply(&msg, &state, &text);
@@ -235,24 +279,50 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         tracing::debug!(user_id, chat_id = msg.chat.id.0, "сообщение пропущено (в ЛС или в группе без обращения к боту)");
         return Ok(());
     }
-    let user_text = if clean.is_empty() { "Привет!".to_string() } else { clean };
+    let mut user_text = if clean.is_empty() { "Привет!".to_string() } else { clean };
+
+    // Если сообщение является ответом на другое сообщение или цитированием — дополняем контекст запроса
+    if let Some(reply) = msg.reply_to_message() {
+        let is_topic_header = msg.thread_id.map(|t| t.0 .0 == reply.id.0).unwrap_or(false)
+            || reply.forum_topic_created().is_some();
+        let is_from_bot = reply.from.as_ref().map(|u| u.id == state.bot_id).unwrap_or(false);
+        if !is_topic_header && !is_from_bot {
+            if let Some(reply_text) = reply.text().or_else(|| reply.caption()) {
+                let reply_author = reply.from.as_ref().map(extract_display_name).unwrap_or_else(|| "Собеседник".to_string());
+                let short_reply: String = reply_text.chars().take(400).collect();
+                user_text = format!("[В ответ на сообщение от {reply_author}: \"{short_reply}\"]\n{user_text}");
+            }
+        }
+    }
+    if let Some(quote) = msg.quote() {
+        if !user_text.contains(&quote.text) {
+            let quote_text: String = quote.text.chars().take(400).collect();
+            user_text = format!("[Цитата: \"{quote_text}\"]\n{user_text}");
+        }
+    }
 
     // Частотный лимит: не более N запросов за окно времени на пользователя.
     // Предотвращает монополизацию очереди одним пользователем, пока бот
     // генерирует ответ — остальные получают свои ответы без задержек.
     if !state.mgr.check_rate_limit(user_id).await {
         let max = state.mgr.rate_limit_max();
-        let window_min = state.mgr.rate_limit_window_secs() / 60;
+        let window_secs = state.mgr.rate_limit_window_secs();
+        let window_str = if window_secs < 60 {
+            format!("{window_secs} сек.")
+        } else if window_secs.is_multiple_of(60) {
+            format!("{} мин.", window_secs / 60)
+        } else {
+            format!("{:.1} мин.", window_secs as f64 / 60.0)
+        };
         tracing::info!(
             user_id,
-            max, window_min,
+            max, window_secs,
             "запрос отклонён: превышен частотный лимит"
         );
         bot.send_message(
             msg.chat.id,
             format!(
-                "⏳ Слишком частые запросы! Лимит — {max} сообщений за {} мин. Подожди немного и попробуй снова.",
-                if window_min > 0 { window_min } else { 1 },
+                "⏳ Слишком частые запросы! Лимит — {max} сообщений за {window_str} Подожди немного и попробуй снова.",
             ),
         )
         .reply_parameters(ReplyParameters::new(msg.id))
@@ -287,7 +357,7 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         a.push_str(delta);
     };
 
-    // Фоновая задача обновления текста в сообщении раз в 1.5 секунды
+    // Фоновая задача обновления текста в сообщении раз в 1.2 секунды
     let accum_bg = accum.clone();
     let finished_bg = finished.clone();
     let bot_bg = bot.clone();
@@ -296,7 +366,7 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
 
     let update_task = tokio::spawn(async move {
         let mut last_shown = String::new();
-        let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        let mut interval = tokio::time::interval(Duration::from_millis(1200));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -319,7 +389,7 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
 
     let answer = state.mgr.reply_stream(user_id, chat_id.0, &display_name, &user_text, on_delta).await;
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = update_task.await;
+    update_task.abort();
     typing.abort();
 
     match answer {
@@ -346,45 +416,13 @@ pub async fn on_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             }
         }
         Err(e) => {
-            // Ошибки в чат ни в коем случае не отправляем — только логируем
             tracing::error!(user_id, elapsed_ms = start.elapsed().as_millis(), "ошибка генерации ответа после реконнектов: {e}");
             if let Some(ph) = placeholder_msg {
-                let _ = bot.delete_message(chat_id, ph.id).await;
+                let _ = bot.edit_message_text(chat_id, ph.id, "⚠️ Не удалось получить ответ от нейросети (сбой провайдера или лимит API). Попробуй ещё раз чуть позже.").await;
             }
         }
     }
     Ok(())
-}
-
-/// Разбирает `/command@bot аргументы` без учёта регистра.
-/// Если указан `@bot_username`, проверяет совпадение с именем нашего бота.
-/// Возвращает None, если команда не подходит или адресована другому боту.
-pub fn manual_command_args<'a>(text: &'a str, name: &str, bot_username: Option<&str>) -> Option<&'a str> {
-    let text = text.trim_start();
-    if text.len() < name.len() {
-        return None;
-    }
-    if !text[..name.len()].eq_ignore_ascii_case(name) {
-        return None;
-    }
-    let rest = &text[name.len()..];
-    let rest = if let Some(tag_and_more) = rest.strip_prefix('@') {
-        let ws_idx = tag_and_more.find(char::is_whitespace).unwrap_or(tag_and_more.len());
-        let mention = &tag_and_more[..ws_idx];
-        if let Some(my_name) = bot_username {
-            if !mention.eq_ignore_ascii_case(my_name) {
-                return None;
-            }
-        }
-        &tag_and_more[ws_idx..]
-    } else {
-        rest
-    };
-    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-        Some(rest.trim())
-    } else {
-        None
-    }
 }
 
 pub fn is_admin(state: &AppState, user_id: i64) -> bool {
@@ -511,12 +549,10 @@ async fn handle_document(bot: Bot, msg: Message, doc: &Document, state: Arc<AppS
 
     let caption = msg.caption().map(ToOwned::to_owned).unwrap_or_default();
 
-    // В группах реагируем на документы с упоминанием/ответом; в ЛС принимаем документы админа напрямую.
+    // В группах загрузка гайдов через документы переадресуется в личные сообщения
     if !msg.chat.is_private() {
-        let (should_reply, _) = should_reply(&msg, &state, &caption);
-        if !should_reply {
-            return Ok(());
-        }
+        bot.send_message(msg.chat.id, pm_redirect_message(state.bot_username.as_deref())).await?;
+        return Ok(());
     }
     if !is_admin(&state, user_id) {
         bot.send_message(msg.chat.id, "🔒 Загружать гайды может только администратор бота.").await?;
@@ -663,8 +699,7 @@ fn is_allowed(state: &AppState, msg: &Message) -> bool {
 }
 
 /// В приватных чатах (ЛС) нейросетью не отвечаем (доступны только команды);
-/// в группах — отвечаем при упоминании @бота, простом ответе (reply) на сообщение
-/// бота или цитировании его сообщения.
+/// в группах — отвечаем при упоминании @бота или ответе (reply / quote) на сообщение бота.
 pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, String) {
     if msg.chat.is_private() {
         return (false, String::new());
@@ -692,35 +727,42 @@ pub fn should_reply(msg: &Message, state: &AppState, text: &str) -> (bool, Strin
         clean = words_out.join(" ");
     }
 
-    // 2. Проверка ответа (reply) на сообщение бота — покрывает как простые
-    //    ответы, так и ответы с цитированием (quote — это частный случай reply).
+    // 2. Проверка ответа (reply) на сообщение бота
     let replied_to_bot = if let Some(reply) = msg.reply_to_message() {
-        let from_bot = reply
-            .from
-            .as_ref()
-            .map(|u| {
-                u.id == state.bot_id
-                    || state
-                        .bot_username
-                        .as_deref()
-                        .map(|b| u.username.as_deref().map(|un| un.eq_ignore_ascii_case(b)).unwrap_or(false))
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        // Исключаем служебное сообщение о создании форум-топика
+        let is_topic_header = msg.thread_id.map(|t| t.0 .0 == reply.id.0).unwrap_or(false)
+            || reply.forum_topic_created().is_some();
 
-        let via_bot = reply
-            .via_bot
-            .as_ref()
-            .map(|u| u.id == state.bot_id)
-            .unwrap_or(false);
+        if is_topic_header {
+            false
+        } else {
+            let from_bot = reply
+                .from
+                .as_ref()
+                .map(|u| {
+                    u.id == state.bot_id
+                        || state
+                            .bot_username
+                            .as_deref()
+                            .map(|b| u.username.as_deref().map(|un| un.eq_ignore_ascii_case(b)).unwrap_or(false))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
 
-        let sender_chat_bot = reply
-            .sender_chat
-            .as_ref()
-            .map(|c| c.id.0 == state.bot_id.0 as i64)
-            .unwrap_or(false);
+            let via_bot = reply
+                .via_bot
+                .as_ref()
+                .map(|u| u.id == state.bot_id)
+                .unwrap_or(false);
 
-        from_bot || via_bot || sender_chat_bot
+            let sender_chat_bot = reply
+                .sender_chat
+                .as_ref()
+                .map(|c| c.id.0 == state.bot_id.0 as i64)
+                .unwrap_or(false);
+
+            from_bot || via_bot || sender_chat_bot
+        }
     } else {
         false
     };
@@ -1061,20 +1103,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manual_command_args_parsing() {
-        assert_eq!(manual_command_args("/guide_add Моё название", "/guide_add", None), Some("Моё название"));
-        assert_eq!(manual_command_args("/guide_add@my_bot Название", "/guide_add", Some("my_bot")), Some("Название"));
-        assert_eq!(manual_command_args("/guide_add@my_bot Название", "/guide_add", Some("MY_BOT")), Some("Название"));
-        assert_eq!(manual_command_args("/guide_add@other_bot Название", "/guide_add", Some("my_bot")), None);
-        assert_eq!(manual_command_args("/guide_add", "/guide_add", None), Some(""));
-        assert_eq!(manual_command_args("/GUIDE_ADD test", "/guide_add", None), Some("test"));
-        assert_eq!(manual_command_args("/set_api https://openai.com", "/set_api", None), Some("https://openai.com"));
-        assert_eq!(manual_command_args("/set_api", "/set_api", None), Some(""));
-        assert_eq!(manual_command_args("/set_model", "/set_model", None), Some(""));
-        assert_eq!(manual_command_args("/set_prompt Ты бот", "/set_prompt", None), Some("Ты бот"));
-        assert_eq!(manual_command_args("/guide_del rust", "/guide_del", None), Some("rust"));
-        assert_eq!(manual_command_args("/guide_addxxx", "/guide_add", None), None);
-        assert_eq!(manual_command_args("привет", "/guide_add", None), None);
+    fn command_parsing_and_redirects() {
+        assert!(Command::parse("/start", "bot").is_ok());
+        assert!(Command::parse("/settings", "bot").is_ok());
+        assert!(Command::parse("/set_model gpt-4o", "bot").is_ok());
+        assert!(Command::parse("/guide_add Название", "bot").is_ok());
+        assert!(Command::parse("/guide_del 1", "bot").is_ok());
+
+        assert_eq!(
+            pm_redirect_message(Some("my_bot")),
+            "ℹ️ Команды и настройки бота доступны только в личных сообщениях: @my_bot"
+        );
+        assert_eq!(
+            pm_redirect_message(None),
+            "ℹ️ Команды и настройки бота доступны только в личных сообщениях с ботом."
+        );
     }
 
     #[test]

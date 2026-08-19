@@ -19,7 +19,9 @@ impl ChatMessage {
         Self { role: "user".into(), content: content.into(), name: None }
     }
     pub fn user_named(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into(), name: Some(name.into()) }
+        let name = name.into();
+        let content = content.into();
+        Self { role: "user".into(), content: format!("{name}: {content}"), name: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self { role: "assistant".into(), content: content.into(), name: None }
@@ -124,7 +126,7 @@ struct StreamDelta {
     content: Option<String>,
 }
 
-const MAX_RETRIES: u32 = 4;
+const MAX_RETRIES: u32 = 2;
 
 impl LlmClient {
     pub fn new() -> Self {
@@ -353,5 +355,18 @@ mod tests {
             body: r#"{"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}}"#.into(),
         };
         assert_eq!(err.to_string(), "API вернул ошибку 401: Incorrect API key provided");
+    }
+
+    #[test]
+    fn chat_message_user_named_and_serialization() {
+        let msg = ChatMessage::user_named("Алиса", "Привет!");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "Алиса: Привет!");
+        assert!(msg.name.is_none());
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""role":"user""#));
+        assert!(json.contains(r#""content":"Алиса: Привет!""#));
+        assert!(!json.contains(r#""name""#));
     }
 }
