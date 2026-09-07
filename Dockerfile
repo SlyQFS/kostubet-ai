@@ -1,31 +1,38 @@
-# ---------- Этап сборки ----------
-FROM rust:1-slim-bookworm AS builder
-WORKDIR /build
+# syntax=docker/dockerfile:1
 
-# Сначала только манифесты: слой с зависимостями кэшируется,
-# пока не меняются Cargo.toml / Cargo.lock.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
- && cargo build --release \
- && rm -rf src target/release/deps/kostubetai*
-
-COPY src ./src
-RUN touch src/main.rs && cargo build --release
-
-# ---------- Рабочий образ ----------
-FROM debian:bookworm-slim AS runtime
-
-# ca-certificates нужны reqwest (rustls) для HTTPS к Telegram и API модели.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && useradd --system --create-home --home-dir /app bot
-
+# ---- Схема зависимостей (кэш) ----
+FROM lukemathwalker/cargo-chef:latest-rust-alpine AS chef
 WORKDIR /app
-COPY --from=builder /build/target/release/kostubetai /usr/local/bin/kostubetai
 
-# База SQLite по умолчанию лежит в data/memory.db — монтируется томом.
-RUN mkdir -p /app/data && chown bot:bot /app/data
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Сборка ----
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Сначала собираем только зависимости — кэшируется до изменения Cargo.toml
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+ENV BINARY_NAME=kostubetai
+RUN cargo build --release --bin kostubetai
+
+# ---- Runtime ----
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S bot \
+    && adduser -S -G bot -h /app bot
+WORKDIR /app
+
+COPY --from=builder /app/target/release/kostubetai /app/kostubetai
+COPY --from=builder /app/migrations /app/migrations
+COPY --from=builder /app/knowledge /app/knowledge
+
+RUN mkdir -p /app/data && chown -R bot:bot /app
 USER bot
 
-CMD ["kostubetai"]
+ENV DB_PATH=/app/data/kostubetai.db \
+    MODELS_CACHE_DIR=/app/data/models
+
+VOLUME ["/app/data"]
+ENTRYPOINT ["/app/kostubetai"]
