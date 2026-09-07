@@ -54,7 +54,6 @@ pub struct Config {
     pub allowed_threads: HashSet<i64>,
     pub db_path: String,
     pub knowledge_dir: String,
-    pub models_cache_dir: String,
     /// Токен-бюджет истории одного чата/топика (скользящее окно).
     pub message_window_tokens: usize,
     /// Максимум символов в одном мета-блоке `<user:...>`.
@@ -142,7 +141,6 @@ impl Config {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "knowledge".to_string());
-        let models_cache_dir = var_or("MODELS_CACHE_DIR", "data/models");
 
         let knowledge_top_n = env::var("KNOWLEDGE_TOP_N")
             .ok()
@@ -169,7 +167,6 @@ impl Config {
             allowed_threads: parse_id_list("ALLOWED_THREADS"),
             db_path,
             knowledge_dir,
-            models_cache_dir,
             message_window_tokens: parse_num("MESSAGE_WINDOW_TOKENS", 4000, 500, 100_000),
             user_meta_chars: parse_num("USER_META_CHARS", 600, 100, 4000),
             max_reply_tokens: parse_num("MAX_REPLY_TOKENS", 1200, 100, 8000),

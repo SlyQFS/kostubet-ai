@@ -8,8 +8,7 @@ description = "Telegram AI-bot with lorebook, per-user state memory and pluggabl
 teloxide = { version = "0.14", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-fastembed = "5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
 rust-stemmers = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

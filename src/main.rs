@@ -52,20 +52,8 @@ async fn main() {
         }
     };
     let cards = kb.cards.len();
-    let cache_dir = cfg.models_cache_dir.clone();
-    let matcher = Arc::new(
-        match tokio::task::spawn_blocking(move || Matcher::new(kb, &cache_dir)).await {
-            Ok(matcher) => matcher,
-            Err(e) => {
-                error!("Поток эмбеддера базы знаний: {e}");
-                std::process::exit(1);
-            }
-        },
-    );
-    tracing::info!(
-        "база знаний: {cards} карточек, семантика: {}",
-        matcher.has_semantic()
-    );
+    let matcher = Arc::new(Matcher::new(kb));
+    tracing::info!("база знаний: {cards} карточек (стемминг + ключи)");
 
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
     let me = match bot.get_me().await {
