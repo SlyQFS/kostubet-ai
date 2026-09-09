@@ -78,11 +78,8 @@ async fn handle_group(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     }
 
     if let Some(wait) = app.limiter.check_and_record(user_id as u64).await {
-        bot.send_message(
-            msg.chat.id,
-            format!("Слишком часто. Подожди {} с.", wait.as_secs().max(1)),
-        )
-        .await?;
+        let text = format!("Слишком часто. Подожди {} с.", wait.as_secs().max(1));
+        send_chat_msg(&bot, msg.chat.id, msg.thread_id, text).await.ok();
         return Ok(());
     }
 
@@ -230,14 +227,15 @@ async fn generate_and_send(
         user_message: &current_user_msg,
     });
 
-    let placeholder_id = match bot.send_message(chat_id, PLACEHOLDER).await {
+    let thread = msg.thread_id;
+    let placeholder_id = match send_chat_msg(&bot, chat_id, thread, PLACEHOLDER).await {
         Ok(m) => Some(m.id),
         Err(e) => {
             tracing::warn!("не отправил плейсхолдер: {e}");
-            None
+            return;
         }
     };
-    let typing = placeholder_id.map(|_| spawn_typing(bot.clone(), chat_id));
+    let typing = placeholder_id.map(|_| spawn_typing(bot.clone(), chat_id, thread));
 
     let _permit = app.queue.clone().acquire_owned().await;
     app.wait_pace().await;
@@ -287,11 +285,11 @@ async fn generate_and_send(
                 .store
                 .add_message(chat_id.0, thread_id, 0, "", Role::Assistant, &clean)
                 .await;
-            send_final(&bot, chat_id, placeholder_id, &clean).await;
+            send_final(&bot, chat_id, thread, placeholder_id, &clean).await;
         }
         Err(e) => {
             tracing::warn!("ошибка LLM: {e}");
-            show_error(&bot, chat_id, placeholder_id, &e).await;
+            show_error(&bot, chat_id, thread, placeholder_id, &e).await;
         }
     }
 
@@ -305,10 +303,18 @@ async fn generate_and_send(
 }
 
 /// Typing-индикация, пока идёт генерация.
-fn spawn_typing(bot: Bot, chat_id: ChatId) -> tokio::task::JoinHandle<()> {
+fn spawn_typing(
+    bot: Bot,
+    chat_id: ChatId,
+    thread_id: Option<teloxide::types::ThreadId>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if bot.send_chat_action(chat_id, ChatAction::Typing).await.is_err() {
+            let mut req = bot.send_chat_action(chat_id, ChatAction::Typing);
+            if let Some(t) = thread_id {
+                req = req.message_thread_id(t);
+            }
+            if req.await.is_err() {
                 break;
             }
             tokio::time::sleep(TYPING_INTERVAL).await;
@@ -350,11 +356,12 @@ fn spawn_progress_editor(
 async fn send_final(
     bot: &Bot,
     chat_id: ChatId,
+    thread_id: Option<teloxide::types::ThreadId>,
     placeholder_id: Option<teloxide::types::MessageId>,
     text: &str,
 ) {
     if text.trim().is_empty() {
-        show_error(bot, chat_id, placeholder_id, &LlmError::Empty).await;
+        show_error(bot, chat_id, thread_id, placeholder_id, &LlmError::Empty).await;
         return;
     }
     let chunks = split_telegram(text, TG_CHUNK);
@@ -365,15 +372,15 @@ async fn send_final(
                     Ok(_) => None,
                     Err(e) => {
                         tracing::warn!("не отредактировал плейсхолдер: {e}");
-                        bot.send_message(chat_id, chunk).await.ok()
+                        send_chat_msg(bot, chat_id, thread_id, chunk).await.ok()
                     }
                 },
-                None => bot.send_message(chat_id, chunk).await.ok(),
+                None => send_chat_msg(bot, chat_id, thread_id, chunk).await.ok(),
             };
             let _ = sent;
         } else {
             tokio::time::sleep(SEND_PAUSE).await;
-            if bot.send_message(chat_id, chunk).await.is_err() {
+            if send_chat_msg(bot, chat_id, thread_id, chunk).await.is_err() {
                 break;
             }
         }
@@ -383,6 +390,7 @@ async fn send_final(
 async fn show_error(
     bot: &Bot,
     chat_id: ChatId,
+    thread_id: Option<teloxide::types::ThreadId>,
     placeholder_id: Option<teloxide::types::MessageId>,
     e: &LlmError,
 ) {
@@ -390,11 +398,24 @@ async fn show_error(
     match placeholder_id {
         Some(id) => {
             if bot.edit_message_text(chat_id, id, hint).await.is_err() {
-                let _ = bot.send_message(chat_id, hint).await;
+                let _ = send_chat_msg(bot, chat_id, thread_id, hint).await;
             }
         }
         None => {
-            let _ = bot.send_message(chat_id, hint).await;
+            let _ = send_chat_msg(bot, chat_id, thread_id, hint).await;
         }
     }
+}
+
+fn send_chat_msg(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: Option<teloxide::types::ThreadId>,
+    text: impl Into<String>,
+) -> teloxide::requests::JsonRequest<teloxide::payloads::SendMessage> {
+    let mut req = bot.send_message(chat_id, text);
+    if let Some(t) = thread_id {
+        req = req.message_thread_id(t);
+    }
+    req
 }
