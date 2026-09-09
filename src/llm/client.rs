@@ -167,6 +167,37 @@ impl LlmClient {
         }
     }
 
+    /// Генерация без стриминга (обычный POST /chat/completions с ретраями).
+    pub async fn plain_chat(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, LlmError> {
+        let mut attempt: u32 = 0;
+        loop {
+            let last_err = match self.attempt_plain(model, messages, max_tokens, temperature).await {
+                Ok(text) if !text.trim().is_empty() => return Ok(text),
+                Ok(_) => Some(LlmError::Empty),
+                Err(e) => {
+                    warn!("запрос к LLM не удался: {e}");
+                    Some(e)
+                }
+            };
+
+            let err = last_err.unwrap_or(LlmError::Empty);
+            if attempt < MAX_RETRIES && err.retryable() {
+                let delay = BACKOFF_BASE_MS * (1 << attempt);
+                warn!("попытка {} не удалась ({err}), повтор через {delay} мс", attempt + 1);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
     async fn attempt_stream(
         &self,
         model: &str,

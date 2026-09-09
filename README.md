@@ -55,6 +55,7 @@ docker compose up -d --build
 | `KNOWLEDGE_DIR` | путь к папке с карточками базы знаний (по умолчанию `knowledge`) |
 | `KNOWLEDGE_TOP_N` | сколько карточек максимум подтягивать в промпт |
 | `KNOWLEDGE_THRESHOLD` | порог cosine-близости для карточек |
+| `STREAMING_ENABLED` | включение/отключение стриминга (`true`/`false`) |
 
 ## Структура
 

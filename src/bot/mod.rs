@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::config::Config;
 use crate::knowledge::matcher::Matcher;
 use crate::llm::client::LlmClient;
@@ -30,6 +32,8 @@ pub struct App {
     pub limiter: RateLimiter,
     pub bot_id: u64,
     pub bot_username: String,
+    /// Стриминг ответов (настраивается на лету админом в ЛС).
+    pub streaming: AtomicBool,
 }
 
 impl std::fmt::Debug for App {
@@ -37,11 +41,22 @@ impl std::fmt::Debug for App {
         f.debug_struct("App")
             .field("models", &self.models.list())
             .field("bot_username", &self.bot_username)
+            .field("streaming", &self.is_streaming())
             .finish_non_exhaustive()
     }
 }
 
 impl App {
+    /// Проверка, активен ли стриминг ответа.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.load(Ordering::Relaxed)
+    }
+
+    /// Переключение состояния стриминга (возвращает новое значение).
+    pub fn toggle_streaming(&self) -> bool {
+        !self.streaming.fetch_xor(true, Ordering::Relaxed)
+    }
+
     /// Выдерживает паузу между запросами к LLM (50 мс) и фиксирует момент.
     pub async fn wait_pace(&self) {
         loop {

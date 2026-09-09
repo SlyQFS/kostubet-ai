@@ -84,17 +84,23 @@ fn split_kv(token: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
-/// Удаление упоминаний бота из текста ответа.
+/// Удаление упоминаний бота из текста ответа (без удаления переносов строк).
 pub fn remove_bot_mention(text: &str, bot_username: &str) -> String {
     if bot_username.is_empty() {
         return text.to_string();
     }
-    let target = format!("@{bot_username}");
-    text.replace(&target, "")
-        .replace(&format!("@{}", bot_username.to_lowercase()), "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let lower_target = format!("@{}", bot_username.to_lowercase());
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(idx) = remaining.to_lowercase().find(&lower_target) {
+        result.push_str(&remaining[..idx]);
+        let after_mention = &remaining[idx + lower_target.len()..];
+        // Пропускаем пробел сразу после упоминания, если есть
+        remaining = after_mention.strip_prefix(' ').unwrap_or(after_mention);
+    }
+    result.push_str(remaining);
+    result.trim().to_string()
 }
 
 #[cfg(test)]
@@ -140,6 +146,11 @@ mod tests {
     #[test]
     fn mention_removed() {
         assert_eq!(remove_bot_mention("@kostubet_bot как дела?", "kostubet_bot"), "как дела?");
+        assert_eq!(remove_bot_mention("@KOSTUBET_BOT как дела?", "kostubet_bot"), "как дела?");
         assert_eq!(remove_bot_mention("норм всё", "kostubet_bot"), "норм всё");
+        assert_eq!(
+            remove_bot_mention("@kostubet_bot 1. Шаг один\n2. Шаг два", "kostubet_bot"),
+            "1. Шаг один\n2. Шаг два"
+        );
     }
 }

@@ -80,6 +80,7 @@ async fn main() {
         limiter,
         bot_id: me.id.0,
         bot_username: me.username.clone().unwrap_or_default(),
+        streaming: std::sync::atomic::AtomicBool::new(cfg.streaming),
     });
 
     if let Err(e) = bot.set_my_commands(Command::bot_commands()).await {

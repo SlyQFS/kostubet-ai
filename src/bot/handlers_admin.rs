@@ -17,6 +17,8 @@ pub enum Command {
     Help,
     #[command(description = "переключить модель (inline-кнопки)")]
     Model,
+    #[command(description = "переключить стриминг ответов (вкл/выкл)")]
+    Stream,
 }
 
 /// Точка входа команд: работает только в ЛС, чужие команды в группах
@@ -55,11 +57,20 @@ pub async fn command(bot: Bot, msg: Message, cmd: Command, app: Arc<App>) -> Res
                 }
             }
         }
+        Command::Stream => {
+            let enabled = app.is_streaming();
+            let keyboard = stream_keyboard(enabled);
+            let text = stream_text(enabled);
+            bot.send_message(msg.chat.id, text)
+                .reply_markup(keyboard)
+                .await
+                .ok();
+        }
     }
     Ok(())
 }
 
-/// Callback от inline-кнопок `/model`.
+/// Callback от inline-кнопок `/model` и `/stream`.
 pub async fn callback(bot: Bot, q: CallbackQuery, app: Arc<App>) -> ResponseResult<()> {
     let from = &q.from;
     if !app.cfg.is_admin(from.id.0 as i64) {
@@ -72,39 +83,52 @@ pub async fn callback(bot: Bot, q: CallbackQuery, app: Arc<App>) -> ResponseResu
     let Some(data) = q.data.as_deref() else {
         return Ok(());
     };
-    let Some(index_str) = data.strip_prefix("model:") else {
-        bot.answer_callback_query(q.id.clone()).await?;
-        return Ok(());
-    };
 
-    let result = index_str
-        .parse::<usize>()
-        .ok()
-        .and_then(|i| app.models.set_index(i).ok());
+    if let Some(index_str) = data.strip_prefix("model:") {
+        let result = index_str
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| app.models.set_index(i).ok());
 
-    match result {
-        Some(model) => {
-            tracing::info!("админ {} переключил модель на {model}", from.id);
-            if let Some(message) = q.message.as_ref() {
-                let keyboard = models_keyboard(&app, Some(app.models.active_index()));
-                bot.edit_message_text(
-                    message.chat().id,
-                    message.id(),
-                    models_text(&app),
-                )
-                .reply_markup(keyboard)
-                .await
-                .ok();
+        match result {
+            Some(model) => {
+                tracing::info!("админ {} переключил модель на {model}", from.id);
+                if let Some(message) = q.message.as_ref() {
+                    let keyboard = models_keyboard(&app, Some(app.models.active_index()));
+                    bot.edit_message_text(
+                        message.chat().id,
+                        message.id(),
+                        models_text(&app),
+                    )
+                    .reply_markup(keyboard)
+                    .await
+                    .ok();
+                }
+                bot.answer_callback_query(q.id.clone())
+                    .text(format!("Модель: {model}"))
+                    .await?;
             }
-            bot.answer_callback_query(q.id.clone())
-                .text(format!("Модель: {model}"))
-                .await?;
+            None => {
+                bot.answer_callback_query(q.id.clone())
+                    .text("Такой модели нет в списке.")
+                    .await?;
+            }
         }
-        None => {
-            bot.answer_callback_query(q.id.clone())
-                .text("Такой модели нет в списке.")
-                .await?;
+    } else if data == "stream:toggle" {
+        let enabled = app.toggle_streaming();
+        tracing::info!("админ {} переключил стриминг: {enabled}", from.id);
+        if let Some(message) = q.message.as_ref() {
+            bot.edit_message_text(
+                message.chat().id,
+                message.id(),
+                stream_text(enabled),
+            )
+            .reply_markup(stream_keyboard(enabled))
+            .await
+            .ok();
         }
+        let hint = if enabled { "Стриминг включён" } else { "Стриминг выключен" };
+        bot.answer_callback_query(q.id.clone()).text(hint).await?;
     }
     Ok(())
 }
@@ -129,14 +153,34 @@ fn models_keyboard(app: &App, active: Option<usize>) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(rows)
 }
 
+fn stream_text(enabled: bool) -> String {
+    let status = if enabled {
+        "ВКЛЮЧЁН (SSE + живой вывод текста в чат)"
+    } else {
+        "ВЫКЛЮЧЕН (отправка ответа целиком после генерации)"
+    };
+    format!("Режим стриминга ответов: {status}\n\nНажми кнопку ниже, чтобы переключить режим на лету:")
+}
+
+fn stream_keyboard(enabled: bool) -> InlineKeyboardMarkup {
+    let label = if enabled {
+        "🟢 Стриминг: ВКЛ (нажми, чтобы выключить)"
+    } else {
+        "🔴 Стриминг: ВЫКЛ (нажми, чтобы включить)"
+    };
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(label, "stream:toggle")]])
+}
+
 fn stub_text() -> String {
     "Этот бот отвечает только в группах. Управление — у администраторов.".to_string()
 }
 
 fn start_text(app: &App) -> String {
+    let stream_status = if app.is_streaming() { "включен" } else { "выключен" };
     format!(
-        "KostubetAI 2.0\nАктивная модель: {}\n\nКоманды:\n/model — сменить модель\n/help — помощь\n\nВ группах бот отвечает на @{} и reply к его сообщениям.",
+        "KostubetAI 2.0\nАктивная модель: {}\nСтриминг: {}\n\nКоманды:\n/model — сменить модель\n/stream — переключить стриминг ответов\n/help — помощь\n\nВ группах бот отвечает на @{} и reply к его сообщениям.",
         app.models.current(),
+        stream_status,
         app.bot_username
     )
 }
@@ -144,6 +188,7 @@ fn start_text(app: &App) -> String {
 fn help_text() -> String {
     "Память: бот держит краткий контекст диалога и мета-блоки участников (цель, текущий шаг).\n\
      База знаний подключается автоматически по смыслу запроса.\n\
-     /model — переключение модели, действует на все чаты."
+     /model — переключение модели (действует сразу на все чаты).\n\
+     /stream — управление стримингом ответов (вкл/выкл на лету)."
         .to_string()
 }
